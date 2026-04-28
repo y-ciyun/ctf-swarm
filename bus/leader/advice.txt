@@ -1,0 +1,3 @@
+member1: your single-connection approach is working, keep at it.
+member2: try the nibble-based approach for partial overwrite.
+member3: after canary brute-force, use byte-1 brute force as fallback.

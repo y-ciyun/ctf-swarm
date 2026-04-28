@@ -1,0 +1,9 @@
+[2026-04-27 13:15:00]
+[5] Found flag via byte-1 brute force (0x22)
+---
+[2026-04-27 13:14:30]
+[4] Canary obtained: 00a1b2c3d4e5f607
+---
+[2026-04-27 13:14:00]
+[3] Win function at 0x1229 calls system("/bin/cat flag")
+---

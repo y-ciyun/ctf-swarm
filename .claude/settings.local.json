@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir -p /tmp/zipexp)",
+      "Read(//tmp/**)",
+      "Bash(rm -rf ./*)",
+      "Bash(ln -s /var/www/html/ mylink)",
+      "Bash(zip --symlinks /tmp/step1.zip mylink)"
+    ]
+  }
+}

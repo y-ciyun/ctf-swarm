@@ -1,0 +1,5 @@
+[5] FLAG FOUND! ctfshow{...}
+[4] Partial overwrite success after 16 nibble attempts, byte-1 = 0x22
+[3] Canary brute-forced: 00a1b2c3d4e5f607 (single connection)
+[2] Win function at 0x1229 - partial overwrite target
+[1] Fork server: canary shared across children, byte-by-byte brute-force possible

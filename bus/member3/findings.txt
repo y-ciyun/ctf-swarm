@@ -1,0 +1,4 @@
+[4] Tried 16 nibble partial overwrites, all failed to capture flag directly
+[3] Canary brute-forced successfully
+[2] Fork server canary bypass confirmed
+[1] Analyzing funcanary binary for canary offset and win function

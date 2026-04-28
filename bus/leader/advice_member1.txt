@@ -1,0 +1,1 @@
+Try using the single-connection canary brute-force approach. Fork server shares canary across all children, so you can brute-force all 7 bytes in one connection without reconnecting.
