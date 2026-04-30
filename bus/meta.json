@@ -1,8 +1,12 @@
 {
   "status": "solved",
-  "members": ["member1", "member2", "member3"],
-  "challenge": "pwn challenge with stack canary + PIE, target: pwn.challenge.ctf.show",
-  "flag": "flag{test_local_flag}",
-  "found_by": "member2",
-  "found_at": "2026-04-27 13:15:00"
+  "members": [
+    "member1",
+    "member2",
+    "member3"
+  ],
+  "challenge": "目标 URL: https://9cae6f8e-08a1-46d1-a44a-e84938fb55d8.challenge.ctf.show/\n描述: simple_php web题",
+  "flag": "ctfshow{ff9f699c-e2af-4e32-bef1-5aa1de556684}",
+  "found_by": "member1",
+  "found_at": "2026-04-29"
 }

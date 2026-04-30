@@ -1,0 +1,26 @@
+### 你的初始探测很好！现在进入下一步
+
+你的发现确认了几个关键点，现在需要针对性推进：
+
+**方向一：从 PHP 层面找线索（你的核心任务）**
+1. `php -i` 输出了 26KB — 仔细搜索其中带 `FLAG`、`flag`、`CTF`、`ctf` 的环境变量
+2. 尝试 `php --ini` 看 PHP 配置文件路径
+3. 尝试 `php -m` 列出所有 PHP 模块
+4. 利用 PHP 的流/封装器：`php -r 'echo file_get_contents("/etc/passwd");'` — 但 `'` 被禁了...
+   - 可以试试把代码写到文件然后 `php -f /tmp/x.php`
+   - 但要先创建文件，需要 `echo ... > /tmp/x.php` — `>` 被 `escapeshellcmd` 转义了
+
+**方向二：穷举根目录文件**
+既然 `du -a /` 输出太大，试试逐目录枚举：
+1. `du -a /bin/` — 看有哪些可用命令
+2. `du -a /etc/ | dd of=/dev/stdout` — 但 `|` 被禁...
+3. 改为分段 `du -a /etc/` 找配置文件
+4. 特别关注 `/etc/nginx/`、`/etc/php/`、`/etc/mysql/`
+
+**方向三：环境变量**
+1. `dd if=/proc/self/environ of=/dev/stdout`
+2. 将输出转为可读：`tr \\0 \\n < /proc/self/environ` — 但 `<` `tr` 都被禁...
+3. 或者用 `rev /proc/self/environ` 直接输出
+4. 或者 `php` 执行：但引号被禁...
+
+**立刻开始测试！用 python requests 发 POST 到目标 URL，报告每个命令的响应。**

@@ -1,5 +1,7 @@
-[5] FLAG FOUND! ctfshow{...}
-[4] Partial overwrite success after 16 nibble attempts, byte-1 = 0x22
-[3] Canary brute-forced: 00a1b2c3d4e5f607 (single connection)
-[2] Win function at 0x1229 - partial overwrite target
-[1] Fork server: canary shared across children, byte-by-byte brute-force possible
+=== 解题记录 - 挑战结束 ===
+1. PHP -r 无引号绕过: 用 php -r print+123; 成功 (避开 echo 含 ch 被拦截)
+2. exec/passthru/system 可用(不含被拦截子串), 但参数带空格是难题
+3. 探索路径: dd/expand/rev 可读文件(路径含 flag/. 则被WAF拦截)
+4. 核心难点: chr(含ch)/file_get_contents(含file)/scandir(含dir)/echo(含ch)均被WAF拦截
+5. 最终队友用 mysqldump --all-databases 从 MySQL 的 PHP_CMS.F1ag_Se3Re7 表找到flag
+6. FLAG: ctfshow{ff9f699c-e2af-4e32-bef1-5aa1de556684}

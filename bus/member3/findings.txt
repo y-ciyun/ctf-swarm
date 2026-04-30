@@ -1,4 +1,11 @@
-[4] Tried 16 nibble partial overwrites, all failed to capture flag directly
-[3] Canary brute-forced successfully
-[2] Fork server canary bypass confirmed
-[1] Analyzing funcanary binary for canary offset and win function
+=== member3 初始分析 ===
+
+[1] 基础探测成功: `echo` 因含 `ch` 被WAF阻止，但 `php -i` 可用（26350 bytes），确认命令执行有效
+[2] 系统信息: Alpine Linux 3.12, Docker容器, PHP 7.3.22 CLI, disable_functions=无限制
+[3] 文件读取验证: `rev /etc/passwd` ✓, `dd if=/etc/passwd of=/dev/stdout` ✓, `comm /etc/passwd /etc/passwd` ✓, `php -w /etc/passwd` ✓
+[4] 文件枚举: `du -a /var/www/html/` 仅有 index.php (4KB), 无 flag.txt/flag.php
+[5] 根目录: `du -a -d 1 /` 未发现 /flag 文件 (只有 /.dockerenv)
+[6] 全盘扫描: `du -a / | grep flag` 仅返回 sysfs/procfs 的 flags 条目, 无 flag 文件
+[7] 核心限制: `.`(点号)和 `flag` 字符串均被WAF阻止，需要绕过才能访问带后缀或含flag的文件
+[8] 当前思路: 寻找不包含 `.` 和 `flag` 的文件路径；或使用PHP流包装器绕过；或寻找非标准flag文件名
+[9] 待探索: nginx/php-fpm配置(`.`被禁导致路径带点文件无法直接读取), MySQL数据库

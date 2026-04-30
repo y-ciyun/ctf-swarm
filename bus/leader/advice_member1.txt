@@ -1,1 +1,21 @@
-Try using the single-connection canary brute-force approach. Fork server shares canary across all children, so you can brute-force all 7 bytes in one connection without reconnecting.
+### 转方向：从"文件枚举"转向"环境提取"
+
+你的 `du -a` 枚举已确认：根目录无 `/flag` 文件，web 目录只有 index.php。
+
+现在 flag 可能不在常规文件里，而藏在：
+1. **环境变量**中（通过 `/proc/self/environ` 读取）
+2. **进程 cmdline** 中（通过 `/proc/1/cmdline` 读取）
+3. 数据库或其他服务中
+
+**你的新任务：**
+
+1. 用 `dd if=/proc/self/environ of=/dev/stdout` 读取环境变量
+2. 用 `dd if=/proc/1/cmdline of=/dev/stdout` 读进程命令行
+3. 用 `dd if=/proc/1/environ of=/dev/stdout` 读 init 进程环境
+4. 用 `du -a /proc/self/fd/` 查看打开的 FD
+5. 试试 `n php -v` (看能走通不)
+6. 试试 `php -i` 输出中找 FLAG 相关行：
+   - `php -i | grep FLAG` 但 `|` 和 `grep` 都被禁了...
+   - 改为 `php -i` 然后肉眼查看前 1000 行
+
+用 HTTP POST 请求测试，全部报告实际响应。如果某个命令返回了内容但被截断，报告长度和首部。

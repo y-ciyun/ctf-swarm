@@ -25,7 +25,6 @@ import yaml
 from bus import FileMessageBus
 
 PROJECT_DIR = Path(__file__).parent.resolve()
-BUS_DIR = PROJECT_DIR / "bus"
 SESSION_RUNNING = False
 
 
@@ -163,17 +162,6 @@ def _has_any(content: str, patterns: list[str]) -> bool:
     return False
 
 
-def _wait_for_any(session: str, window: str, patterns: list[str],
-                   timeout: int = 25, interval: float = 0.5) -> bool:
-    """Wait until pane content matches any pattern."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if _has_any(_capture_pane(session, window), patterns):
-            return True
-        time.sleep(interval)
-    return False
-
-
 def _start_one_agent(session: str, agent_id: str, agent_type: str,
                       agent_cfg: dict, prompt_file: Path) -> bool:
     """Set up one agent in a tmux window. Returns True on success."""
@@ -189,7 +177,8 @@ def _start_one_agent(session: str, agent_id: str, agent_type: str,
                    check=True, timeout=10)
 
     # Start claude
-    startup = f"cd {PROJECT_DIR} && {env_exports} && claude --permission-mode bypassPermissions"
+    claude_path = "/home/yy/.nvm/versions/node/v24.15.0/bin/claude"
+    startup = f"cd {PROJECT_DIR} && {env_exports} && export PATH=/home/yy/.nvm/versions/node/v24.15.0/bin:$PATH && {claude_path} --permission-mode bypassPermissions"
     subprocess.run(["tmux", "send-keys", "-t", f"{session}:{window_name}",
                     startup, "Enter"], check=True, timeout=10)
 
@@ -271,8 +260,7 @@ def _start_one_agent(session: str, agent_id: str, agent_type: str,
     return True
 
 
-def tmux_start(config: dict, prompt_info: list, challenge_desc: str,
-               background: bool = False) -> None:
+def tmux_start(config: dict, prompt_info: list, challenge_desc: str) -> None:
     session_name = "ctf-swarm"
     bus_dir = str(PROJECT_DIR / (config.get("bus_dir", "bus")))
 
@@ -316,10 +304,10 @@ def tmux_start(config: dict, prompt_info: list, challenge_desc: str,
 # ── 调度器（永久监控 + 唤醒 agent） ──────────────
 
 _IDLE_CHECK_INTERVAL = 15        # 轮询间隔（秒）
-_MIN_WAKEUP_INTERVAL = 40        # 同一 agent 最短唤醒间隔
-_FINDINGS_STALE = 90             # findings 多久未更新视为过期
-_ADVICE_STALE = 120              # advice 多久未更新视为过期
-_STARTUP_GRACE = 30              # 启动后前 N 秒不唤醒（短暂等待避免重复唤醒）
+_MIN_WAKEUP_INTERVAL = 30        # 同一 agent 最短唤醒间隔
+_STARTUP_GRACE = 30              # 启动后前 N 秒不唤醒
+_AGENT_RECOVERY_INTERVAL = 60    # API 错误自动重试最小间隔（秒）
+_MAX_RECOVERY_RETRIES = 3        # 单个 agent 最大自动重试次数
 
 
 def _is_agent_idle(session: str, agent_id: str) -> bool:
@@ -347,103 +335,48 @@ def _is_agent_idle(session: str, agent_id: str) -> bool:
         return False
 
 
-def _force_push_targeted_advice(session: str, member_id: str, advice: str) -> None:
-    """强制推送针对性建议：Esc 打断 → paste → Enter 提交。"""
-    # 1. Esc 打断当前思考/任务
-    subprocess.run(["tmux", "send-keys", "-t", f"{session}:{member_id}", "Escape"],
-                   capture_output=True, timeout=5)
-    time.sleep(0.5)
 
-    # 2. Paste 建议
-    buf_name = f"tadv_{member_id}"
-    msg = f"=== 队长针对性建议 ===\n{advice}\n\n请认真处理队长的建议。"
-    subprocess.run(["tmux", "set-buffer", "-b", buf_name, msg],
-                   capture_output=True, timeout=5)
-    subprocess.run(["tmux", "paste-buffer", "-b", buf_name,
-                    "-t", f"{session}:{member_id}", "-d"],
+
+_API_ERROR_PATTERNS = (
+    'api error',
+    'socket connection was closed',
+    'socket closed unexpectedly',
+    'connection error',
+    'insufficient balance',
+    'rate limit exceeded',
+    'internal server error',
+    'bad gateway',
+    'service unavailable',
+    'timeout occurred',
+)
+
+
+def _has_api_error(content: str) -> bool:
+    """Check if an agent pane contains an API error that needs recovery."""
+    for pattern in _API_ERROR_PATTERNS:
+        if pattern in content.lower():
+            return True
+    return False
+
+
+def _recover_agent(session: str, agent_id: str) -> None:
+    """Recover an agent from API error by sending Enter to retry."""
+    subprocess.run(["tmux", "send-keys", "-t", f"{session}:{agent_id}", "Escape"],
                    capture_output=True, timeout=5)
     time.sleep(0.3)
-
-    # 3. Enter 提交
-    subprocess.run(["tmux", "send-keys", "-t", f"{session}:{member_id}", "Enter"],
+    subprocess.run(["tmux", "send-keys", "-t", f"{session}:{agent_id}", "Enter"],
                    capture_output=True, timeout=5)
+    log(f"🔄 自动恢复 {agent_id}（API 错误后重试）")
 
 
-def _detect_member_errors(session: str) -> dict[str, list[str]]:
-    """轻量检测：扫描成员 pane 输出中的错误模式。
-    只取最近的错误行，用于唤醒 leader 时提供上下文。"""
-    ERROR_PATTERNS = (r'\bError\b', r'\bFail(?:ed|ure)?\b', r'Segfault',
-                      r'Traceback', r'trace/breakpoint', r'Killed',
-                      r'coredump', r'stack smashing', r'Timeout')
-    flags = {}
-    for mid in ("member1", "member2", "member3"):
-        try:
-            content = _capture_pane(session, mid)
-            errors = []
-            for line in content.split('\n'):
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                for pat in ERROR_PATTERNS:
-                    if re.search(pat, stripped, re.IGNORECASE):
-                        errors.append(stripped[:100])
-                        break
-            if errors:
-                # 去重 + 取最后 3 条
-                seen = set()
-                unique = []
-                for e in reversed(errors):
-                    if e not in seen:
-                        seen.add(e)
-                        unique.append(e)
-                    if len(unique) >= 3:
-                        break
-                flags[mid] = list(reversed(unique))
-        except Exception:
-            pass
-    return flags
-
-
-def _build_wakeup_context(bus: FileMessageBus, agent_id: str, session: str = "") -> str:
-    """构建唤醒消息：汇总队友最新发现+队长建议+错误标记，简明扼要。"""
-    if agent_id == "leader":
-        parts = ["=== 调度唤醒 队长 ===", "各成员进度:"]
-        error_flags = _detect_member_errors(session) if session else {}
-        for mid in ("member1", "member2", "member3"):
-            f = bus.get_finding(mid)
-            summary = f.strip().split('\n')[0][:80] if f else "(无发现)"
-            activity = _get_member_recent_activity(session, mid) if session else ""
-            flags = []
-            if mid in error_flags:
-                flags.append("⚠ 疑似卡住（连续错误）")
-            if activity:
-                parts.append(f"  [{mid}] {summary}")
-                parts.append(f"    最近: {activity}")
-            else:
-                parts.append(f"  [{mid}] {summary}")
-            if flags:
-                parts.append(f"    {' '.join(flags)}")
-        parts.append("\n【全局建议】写入 leader/advice.txt（所有成员被动读取）")
-        parts.append("【针对性建议】写入 leader/advice_memberX.txt（调度器强制打断+推送）")
-        return '\n'.join(parts)
-
-    parts = ["=== 调度唤醒 ==="]
-
-    advice = bus.get_advice()
-    if advice:
-        line = advice.strip().split('\n')[0][:120]
-        parts.append(f"[队长] {line}")
-
-    for mid in ("member1", "member2", "member3"):
-        if mid == agent_id:
-            continue
-        f = bus.get_finding(mid)
-        if f:
-            first = f.strip().split('\n')[0][:100]
-            parts.append(f"[{mid}] {first}")
-
-    parts.append("\n请按以下步骤执行：\n1. 将当前进展写入 bus/" + agent_id + "/findings.txt（滚动列表格式，新内容加最前面，保留最近5条），同时追加到 bus/" + agent_id + "/log.txt\n2. 阅读以上情报，继续解题")  # noqa: E501
-    return '\n'.join(parts)
+def _build_wakeup_context() -> str:
+    """构建唤醒消息：纯通知，不夹带任何数据。"""
+    return (
+        "=== 系统通知 ===\n"
+        "成员发现已更新，请读取各成员的 findings.txt 了解最新进展。\n"
+        "根据情况通过 advice_memberX.txt 进行针对性指挥。\n"
+        "写入后调度器会强制打断对应成员。"
+    )
 
 
 def _wake_agent(session: str, agent_id: str, message: str) -> None:
@@ -474,32 +407,65 @@ def _wake_agent(session: str, agent_id: str, message: str) -> None:
                    capture_output=True, timeout=5)
 
 
-# ── 启动增强：队长延迟 + 初始唤醒 ─────────────────
+def _force_push_message(session: str, member_id: str, msg: str, buf_suffix: str = "fpush") -> None:
+    """通用强制推送：检测状态 → 仅必要时打断 → paste 消息 → Enter。
 
-def _get_member_recent_activity(session: str, member_id: str) -> str:
-    """从 tmux pane 提取最近工具调用摘要。"""
-    try:
-        content = _capture_pane(session, member_id)
-        lines = content.split('\n')
-        # 从后往前找最近 3 个含 ●（工具调用）或 ⎿（结果）的行
-        hits = []
-        for line in reversed(lines):
-            s = line.strip()
-            if s.startswith('●'):
-                hits.append(s[:90])
-            if len(hits) >= 2:
-                break
-        if not hits:
-            # 退一步：找任意非空非状态行
-            for line in reversed(lines):
-                s = line.strip()
-                if s and not s.startswith('─') and not s.startswith('⏵') and not s.startswith('❯') and not s.startswith('Press'):
-                    hits.append(s[:90])
-                if len(hits) >= 2:
-                    break
-        return ' | '.join(reversed(hits)) if hits else "(无)"
-    except Exception:
-        return "(?)"
+    注意：3x Esc 在 Claude 处于 "Interrupted" 状态时会破坏输入，
+    导致 paste 被吞掉。改用状态感知：
+    - 思考中 → 1x Esc 打断
+    - Interrupted → 直接输入（无需 Esc）
+    - 空闲 → 直接输入
+    """
+    content = _capture_pane(session, member_id)
+    needs_interrupt = (
+        not _is_agent_idle(session, member_id)
+        and "what should claude do instead" not in content.lower()
+    )
+
+    if needs_interrupt:
+        subprocess.run(["tmux", "send-keys", "-t", f"{session}:{member_id}", "Escape"],
+                       capture_output=True, timeout=5)
+        time.sleep(0.4)
+
+    buf_name = f"{buf_suffix}_{member_id}"
+    subprocess.run(["tmux", "set-buffer", "-b", buf_name, msg],
+                   capture_output=True, timeout=5)
+    subprocess.run(["tmux", "paste-buffer", "-b", buf_name,
+                    "-t", f"{session}:{member_id}", "-d"],
+                   capture_output=True, timeout=5)
+    time.sleep(0.5)
+
+    # 检查是否被 queue，需要 Up 提交
+    content = _capture_pane(session, member_id)
+    if "queued messages" in content.lower():
+        subprocess.run(["tmux", "send-keys", "-t", f"{session}:{member_id}", "Up"],
+                       capture_output=True, timeout=5)
+        time.sleep(0.3)
+
+    subprocess.run(["tmux", "send-keys", "-t", f"{session}:{member_id}", "Enter"],
+                   capture_output=True, timeout=5)
+
+
+def _force_push_targeted_advice(session: str, member_id: str) -> None:
+    """强制打断某个成员：队长有针对性纠偏。"""
+    _force_push_message(session, member_id,
+        "=== ⚠ 紧急 ===\n"
+        f"队长有强制指示！请立即停止当前工作。\n"
+        f"读取 ./bus/leader/advice_{member_id}.txt 获取详细指令。",
+        buf_suffix="tadv")
+
+
+def _force_push_broadcast_advice(session: str) -> None:
+    """广播全局策略给所有成员：队长完成了战略部署。"""
+    for mid in ("member1", "member2", "member3"):
+        _force_push_message(session, mid,
+            "=== 战略部署 ===\n"
+            "队长发布了全局策略！请立即停止当前工作。\n"
+            "读取 ./bus/leader/advice.txt 了解你的任务分配。",
+            buf_suffix="badv")
+
+
+# ── 启动增强：队长延迟 + 初始唤醒 ─────────────────
 
 
 def _initial_wake_members(session: str, config: dict, prompt_info: list) -> None:
@@ -574,8 +540,6 @@ def _initial_wake_members(session: str, config: dict, prompt_info: list) -> None
 def _scan_panes_for_flag(session: str) -> tuple[str | None, str | None]:
     """Scan all agent tmux panes for real CTF flag patterns (fallback for agent hallucination).
     Avoids false positives from test flags, code snippets, or example text."""
-    EXCLUDE_PATTERNS = (r'test', r'example', r'local_test', r'placeholder', r'TODO', r'xxxx')
-    # Only match: ctfshow with UUID, or flag{...} with meaningful content (no test/example)
     FLAG_PATTERNS = (
         r'ctfshow\{[a-f0-9\-]{20,}\}',                    # ctfshow UUID format
         r'flag(?!\{[^}]*?(?:test|example|local|TODO|xxx))'  # exclude common test patterns
@@ -599,127 +563,133 @@ def _scan_panes_for_flag(session: str) -> tuple[str | None, str | None]:
 
 
 def _run_scheduler(config: dict, bus: FileMessageBus, session: str) -> None:
-    """永久调度循环：检测 idle → 唤醒 → 轮询。"""
-    log("调度器启动 — 每 15s 轮询 agent 状态")
-    last_wake: dict[str, float] = {}
+    """永久调度循环：监视文件 mtime 变化 → 唤醒对应 agent。不做判断，不做转述。"""
+    log("调度器启动 — 文件监视模式")
+
+    # 跟踪 mtime
+    _findings_mtimes: dict[str, float] = {}
+    _advice_txt_mtime: float = 0.0
+    _advice_mtimes: dict[str, float] = {}
+    _findings_dirty: dict[str, bool] = {}
+    _last_leader_wake = 0.0
+    _last_member_wake: dict[str, float] = {}
+    # API 错误自动恢复跟踪
+    _agent_error_counts: dict[str, int] = {}
+    _last_agent_recovery: dict[str, float] = {}
     startup_time = time.monotonic()
 
-    def _file_age(rel_path: str) -> float:
-        p = bus.bus_dir / rel_path
-        return time.time() - p.stat().st_mtime if p.exists() else 9999
-
-    # 追踪针对性建议文件的 mtime
-    _advice_mtimes: dict[str, float] = {}
+    # 初始化：记录当前 mtime（避免启动时误触发）
+    advice_txt_path = bus.bus_dir / "leader" / "advice.txt"
+    if advice_txt_path.exists():
+        _advice_txt_mtime = advice_txt_path.stat().st_mtime
     for mid in ("member1", "member2", "member3"):
-        p = bus.bus_dir / "leader" / f"advice_{mid}.txt"
-        if p.exists():
-            _advice_mtimes[mid] = p.stat().st_mtime
+        fp = bus.bus_dir / mid / "findings.txt"
+        _findings_mtimes[mid] = fp.stat().st_mtime if fp.exists() else 0
+        ap = bus.bus_dir / "leader" / f"advice_{mid}.txt"
+        _advice_mtimes[mid] = ap.stat().st_mtime if ap.exists() else 0
+        _findings_dirty[mid] = False
+        _agent_error_counts[mid] = 0
+        _last_agent_recovery[mid] = 0.0
+    _agent_error_counts["leader"] = 0
+    _last_agent_recovery["leader"] = 0.0
+
+    def _handle_flag(flag: str, finder: str) -> None:
+        """Flag 已找到，收尾。"""
+        log(f"🎯 Flag found by {finder}: {flag}")
+        time.sleep(3)
+        for agent_id in ("member1", "member2", "member3"):
+            _wake_agent(session, agent_id,
+                "=== 挑战已结束 ===\nFlag 已被找到，解题完成。")
+        _wake_agent(session, "leader",
+            "Flag 已找到！请汇总 writeup 写入 bus/leader/writeup.md")
+        wp_path = bus.bus_dir / "leader" / "writeup.md"
+        for _ in range(12):
+            time.sleep(5)
+            if wp_path.exists() and wp_path.stat().st_size > 0:
+                break
+        print(f"\n  ✅ FLAG: {flag} (by {finder})")
+        if wp_path.exists():
+            print(f"\n  📝 Writeup:\n{wp_path.read_text(encoding='utf-8')[:2000]}")
 
     try:
         while True:
-            # 启动宽限期：不打扰第一轮执行
             if time.monotonic() - startup_time < _STARTUP_GRACE:
                 time.sleep(_IDLE_CHECK_INTERVAL)
                 continue
 
-            # 检测针对性建议文件（leader 写的新 advice_memberX.txt）→ 强制推送
-            for mid in ("member1", "member2", "member3"):
-                p = bus.bus_dir / "leader" / f"advice_{mid}.txt"
-                cur_mtime = p.stat().st_mtime if p.exists() else 0
-                prev_mtime = _advice_mtimes.get(mid, 0)
-                if cur_mtime and cur_mtime != prev_mtime:
-                    content = p.read_text(encoding="utf-8").strip()
-                    if content:
-                        log(f"检测到 → 强制推送针对性建议给 {mid}")
-                        _force_push_targeted_advice(session, mid, content)
-                        last_wake[mid] = time.time()
-                    _advice_mtimes[mid] = cur_mtime
-
-            # 从 tmux pane 检测 flag（兜底 agent 幻觉）
-            flag_txt_path = bus.bus_dir / "flag.txt"
-            flag, finder = _scan_panes_for_flag(session)
-            if flag and not bus.is_solved() and not flag_txt_path.exists():
-                bus.set_flag_found(flag, finder or "unknown")
-                flag_txt_path.write_text(f"{finder}: {flag}\n", encoding="utf-8")
-                log(f"🎯 Flag detected from [{finder}] pane: {flag}")
-                solved = True
-            else:
-                # 检查 flag（支持两种方式：meta.json 或 flag.txt）
-                solved = bus.is_solved() or flag_txt_path.exists()
-
-            if solved and not bus.is_solved() and flag_txt_path.exists():
-                raw = flag_txt_path.read_text(encoding="utf-8").strip()
-                bus.set_flag_found(raw, "unknown")
-
-            if solved:
+            # ── Flag 检测 ──
+            if bus.is_solved() or (bus.bus_dir / "flag.txt").exists():
                 meta = bus.get_meta()
                 flag = meta.get("flag", "?")
                 finder = meta.get("found_by", "?")
-                # 如果 meta 中没有 flag，从 flag.txt 读取
-                if flag == "?" and flag_txt_path.exists():
-                    raw = flag_txt_path.read_text(encoding="utf-8").strip()
-                    # 格式可能是 "member2: flag{...}" 或 "flag{...}"
-                    m = re.search(r'flag\{[^}]+\}', raw)
-                    if m:
-                        flag = m.group(0)
-                    else:
-                        flag = raw
-                log(f"🎯 Flag found by {finder}: {flag}")
-
-                # 给找到 flag 的成员一点时间写 findings.txt
-                time.sleep(3)
-
-                # 通知所有成员停止解题
-                for agent_id in ("member1", "member2", "member3"):
-                    _wake_agent(session, agent_id,
-                        "=== 挑战已结束 ===\nFlag 已被找到（" + finder + "），解题完成。请停止工作，无需继续分析。")  # noqa: E501
-                log("已通知所有成员停止解题")
-
-                # 唤醒 leader 生成 writeup
-                log("唤醒 leader 生成 writeup...")
-                _wake_agent(session, "leader",
-                    "Flag 已找到！请立即读取所有成员的 findings.txt，汇总生成完整的 writeup，写入 bus/leader/writeup.md")  # noqa: E501
-
-                # 等待 writeup（最多等 60s）
-                wp_path = bus.bus_dir / "leader" / "writeup.md"
-                for _ in range(12):
-                    time.sleep(5)
-                    if wp_path.exists() and wp_path.stat().st_size > 0:
-                        break
-
-                print(f"\n  ✅ FLAG: {flag} (by {finder})")
-                if wp_path.exists():
-                    content = wp_path.read_text(encoding="utf-8")[:2000]
-                    print(f"\n  📝 Writeup:\n{content}")
-                else:
-                    print("  (leader 未生成 writeup)")
+                if flag == "?":
+                    flag = "flag{...}"
+                _handle_flag(flag, finder)
                 return
 
-            now = time.time()
+            flag, finder = _scan_panes_for_flag(session)
+            if flag and not bus.is_solved():
+                bus.set_flag_found(flag, finder or "unknown")
+                _handle_flag(flag, finder or "unknown")
+                return
 
-            for agent_id in ("member1", "member2", "member3"):
-                if not _is_agent_idle(session, agent_id):
+            now_mono = time.monotonic()
+
+            # ── 监测 findings 变化 → 标记 dirty → 唤醒 leader ──
+            for mid in ("member1", "member2", "member3"):
+                fp = bus.bus_dir / mid / "findings.txt"
+                cur = fp.stat().st_mtime if fp.exists() else 0
+                if cur != _findings_mtimes[mid]:
+                    _findings_mtimes[mid] = cur
+                    _findings_dirty[mid] = True
+
+            if any(_findings_dirty.values()):
+                if now_mono - _last_leader_wake >= _MIN_WAKEUP_INTERVAL:
+                    if _is_agent_idle(session, "leader"):
+                        _wake_agent(session, "leader",
+                            _build_wakeup_context())
+                        _last_leader_wake = now_mono
+                        for mid in ("member1", "member2", "member3"):
+                            _findings_dirty[mid] = False
+                        log("唤醒 leader（新发现）")
+
+            # ── 监测 advice.txt 变化 → 广播全局策略给所有成员 ──
+            ap_txt = bus.bus_dir / "leader" / "advice.txt"
+            cur_txt = ap_txt.stat().st_mtime if ap_txt.exists() else 0
+            if cur_txt and cur_txt != _advice_txt_mtime:
+                _advice_txt_mtime = cur_txt
+                _force_push_broadcast_advice(session)
+                log("广播全局策略（advice.txt）")
+
+            # ── 监测 advice_memberX.txt 变化 → 强制打断对应成员 ──
+            for mid in ("member1", "member2", "member3"):
+                ap = bus.bus_dir / "leader" / f"advice_{mid}.txt"
+                cur = ap.stat().st_mtime if ap.exists() else 0
+                if cur != _advice_mtimes[mid]:
+                    _advice_mtimes[mid] = cur
+                    if now_mono - _last_member_wake.get(mid, 0) >= _MIN_WAKEUP_INTERVAL:
+                        _force_push_targeted_advice(session, mid)
+                        _last_member_wake[mid] = now_mono
+                        log(f"强制打断 {mid}（新建议）")
+
+            # ── Agent 健康检测：API 错误自动恢复 ──
+            for agent_id in ("leader", "member1", "member2", "member3"):
+                if agent_id not in _last_agent_recovery:
                     continue
-                if now - last_wake.get(agent_id, 0) < _MIN_WAKEUP_INTERVAL:
+                try:
+                    content = _capture_pane(session, agent_id)
+                    if _has_api_error(content):
+                        if _agent_error_counts.get(agent_id, 0) >= _MAX_RECOVERY_RETRIES:
+                            continue  # 已达最大重试次数，不再干预
+                        if now_mono - _last_agent_recovery.get(agent_id, 0) >= _AGENT_RECOVERY_INTERVAL:
+                            _recover_agent(session, agent_id)
+                            _agent_error_counts[agent_id] = _agent_error_counts.get(agent_id, 0) + 1
+                            _last_agent_recovery[agent_id] = now_mono
+                    else:
+                        # 无错误 → 重置计数（说明 agent 已恢复）
+                        _agent_error_counts[agent_id] = 0
+                except Exception:
                     continue
-                age = _file_age(f"{agent_id}/findings.txt")
-                if age < _FINDINGS_STALE:
-                    continue  # 近期有更新，不唤醒
-
-                msg = _build_wakeup_context(bus, agent_id, session)
-                _wake_agent(session, agent_id, msg)
-                last_wake[agent_id] = now
-                log(f"唤醒 {agent_id}")
-
-            # 队长检查
-            if _is_agent_idle(session, "leader"):
-                if now - last_wake.get("leader", 0) >= _MIN_WAKEUP_INTERVAL:
-                    age = _file_age("leader/advice.txt")
-                    if age >= _ADVICE_STALE:
-                        msg = _build_wakeup_context(bus, "leader", session)
-                        _wake_agent(session, "leader", msg)
-                        last_wake["leader"] = now
-                        log("唤醒 leader")
 
             time.sleep(_IDLE_CHECK_INTERVAL)
 
@@ -816,7 +786,7 @@ def run_challenge(config: dict, bus: FileMessageBus, user_input: str,
 
     # 启动
     if use_tmux:
-        tmux_start(config, prompt_info, challenge_desc, background=background)
+        tmux_start(config, prompt_info, challenge_desc)
         _run_scheduler(config, bus, "ctf-swarm")
     else:
         print(f"\n  📋 请启动 4 个 claude 实例，粘贴对应的提示词：")

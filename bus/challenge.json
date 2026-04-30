@@ -1,5 +1,5 @@
 {
-  "description": "pwn challenge funcanary - stack canary + PIE bypass",
-  "url": "http://pwn.challenge.ctf.show:28194",
+  "description": "simple_php web题\n小明在学习CTF的过程中遇到了一道PHP的题目，以他有限的水平做不出来，可以帮帮他吗？\n题目链接: https://9cae6f8e-08a1-46d1-a44a-e84938fb55d8.challenge.ctf.show/\n源码:\n<?php\nini_set('open_basedir', '/var/www/html/');\nerror_reporting(0);\nif(isset($_POST['cmd'])){\n    $cmd = escapeshellcmd($_POST['cmd']); \n    if (!preg_match('/ls|dir|nl|nc|cat|tail|more|flag|sh|cut|awk|strings|od|curl|ping|\\*|sort|ch|zip|mod|sl|find|sed|cp|mv|ty|grep|fd|df|sudo|more|cc|tac|less|head|\\.|{|}|tar|zip|gcc|uniq|vi|vim|file|xxd|base64|date|bash|env|\\?|wget|\\'|\\\"|id|whoami/i', $cmd)) {\n        system($cmd);\n    }\n}\nshow_source(__FILE__);\n?>\n关键: escapeshellcmd(不是escapeshellarg)会导致命令参数注入。WAF黑名单限制了大量命令和字符如flag/.等,需要绕过命令执行和读取flag文件。",
+  "url": "https://9cae6f8e-08a1-46d1-a44a-e84938fb55d8.challenge.ctf.show/",
   "_type": "url"
 }

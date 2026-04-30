@@ -7,7 +7,7 @@
   ├── meta.json              # 运行状态、flag 等
   ├── member1/
   │   ├── findings.txt       # 最新发现（覆盖写）
-  │   └── log_001.txt        # 历史记录（追加）
+  │   └── log.txt            # 历史记录（追加）
   ├── member2/
   │   ├── findings.txt
   │   └── log_001.txt
@@ -15,12 +15,13 @@
   │   ├── findings.txt
   │   └── log_001.txt
   └── leader/
-      ├── advice.txt         # 最新建议（覆盖写）
+      ├── advice_member1.txt # 队长给 member1 的建议
+      ├── advice_member2.txt # 队长给 member2 的建议
+      ├── advice_member3.txt # 队长给 member3 的建议
       └── writeup.md         # 最终解题报告
 """
 
 import json
-import os
 import time
 from pathlib import Path
 from typing import Optional
@@ -97,45 +98,6 @@ class FileMessageBus:
             mid: self.get_finding(mid)
             for mid in ("member1", "member2", "member3")
         }
-
-    # ── 队长建议（全局） ──────────────────────────────
-
-    def post_advice(self, advice: str) -> None:
-        leader_dir = self.bus_dir / "leader"
-        leader_dir.mkdir(parents=True, exist_ok=True)
-        (leader_dir / "advice.txt").write_text(advice, encoding="utf-8")
-
-    def get_advice(self) -> str:
-        f = self.bus_dir / "leader" / "advice.txt"
-        if f.exists():
-            return f.read_text(encoding="utf-8").strip()
-        return ""
-
-    # ── 队长针对性建议（按成员） ──────────────────────
-
-    def post_targeted_advice(self, member_id: str, advice: str) -> None:
-        leader_dir = self.bus_dir / "leader"
-        leader_dir.mkdir(parents=True, exist_ok=True)
-        (leader_dir / f"advice_{member_id}.txt").write_text(advice, encoding="utf-8")
-
-    def get_targeted_advice(self, member_id: str) -> str:
-        f = self.bus_dir / "leader" / f"advice_{member_id}.txt"
-        if f.exists():
-            return f.read_text(encoding="utf-8").strip()
-        return ""
-
-    def clear_targeted_advice(self, member_id: str) -> None:
-        f = self.bus_dir / "leader" / f"advice_{member_id}.txt"
-        if f.exists():
-            f.unlink()
-
-    def get_all_targeted_advice_mtimes(self) -> dict[str, float]:
-        result = {}
-        for mid in ("member1", "member2", "member3"):
-            f = self.bus_dir / "leader" / f"advice_{mid}.txt"
-            if f.exists():
-                result[mid] = f.stat().st_mtime
-        return result
 
     # ── Writeup ───────────────────────────────────────
 

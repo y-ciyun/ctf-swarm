@@ -1,9 +1,18 @@
-[2026-04-27 13:15:00]
-[5] Found flag via byte-1 brute force (0x22)
----
-[2026-04-27 13:14:30]
-[4] Canary obtained: 00a1b2c3d4e5f607
----
-[2026-04-27 13:14:00]
-[3] Win function at 0x1229 calls system("/bin/cat flag")
----
+[INIT] 开始分析挑战。目标: simple_php WEB题, 使用escapeshellcmd+WAF。
+[ANALYSIS] 关键发现: escapeshellcmd仅转义特殊字符,不阻止参数注入; WAF屏蔽大量命令和flag/.等。
+[PLAN] 第一阶段: 探测目标,列出文件。第二阶段: 尝试读取flag。第三阶段: 尝试多种绕过。
+[EXPLORE] du -a /var/www/html/ → 仅 index.php
+[EXPLORE] /flag 和 /flag.txt 返回 200 但和 index.php 内容完全一致(路由问题)
+[EXPLORE] /var/www/localhost/htdocs 存在(可能是默认页面)
+[EXPLORE] 系统是 Alpine Linux, /tmp /opt 均为空, /home 有 www-data
+[STRATEGY] 队长分配任务: member1负责文件枚举, 找到所有文件位置
+[REDIRECT] 队长指示从文件枚举转向环境提取
+[ENVIRON] dd/rev/expand 读取 /proc 信息 — flag仅占位符 not_flag
+[ENVIRON] 发现 docker-php-entrypoint → source /flag.sh + mysql 导入 db.sql
+[ENVIRON] FLAG=not_flag 为占位符, 真实flag可能在 MySQL 中
+[APPROACH] mysql --version 可产生 stdout, 但 --execute 无输出
+[APPROACH] mysqldump ctf 无表(数据库名不对)
+[BREAKTHROUGH] mysqldump --all-databases → 发现 PHP_CMS 数据库
+[BREAKTHROUGH] PHP_CMS.F1ag_Se3Re7 表 → flag66_2024 列 → flag!
+[FLAG] ctfshow{ff9f699c-e2af-4e32-bef1-5aa1de556684}
+[SOLVED] Flag 已写入 bus/flag.txt, 挑战完成

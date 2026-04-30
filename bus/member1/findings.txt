@@ -1,5 +1,15 @@
-[5] Found flag via byte-1 brute force (0x22)
-[4] Canary obtained: 00a1b2c3d4e5f607
-[3] Win function at 0x1229 calls system("/bin/cat flag")
-[2] Fork server detected - canary constant across children
-[1] Stack canary + PIE challenge: buffer overflow at 104 bytes offset
+=== 战略部署: 文件枚举 → 环境提取 → MySQL 查询 ===
+[发现1] du -a /var/www/html/ → 仅 index.php
+[发现2] /flag 和 /flag.txt URL 返回 200 但内容 = index.php源码(路由到同一PHP)
+[发现3] /var/www/ 下只有 html/ 和 localhost/htdocs/, 无flag文件
+[发现4] Alpine Linux, /tmp/空 /opt/空 /home/有www-data
+[发现5] 环境变量 FLAG=not_flag (占位符, 非真实flag)
+[发现6] docker-php-entrypoint 会 source /flag.sh 并导入 db.sql 到 MySQL
+[发现7] /flag.sh 路径含 "flag" 被 WAF 拦截，无法直接读取
+[发现8] mysqlshow 被 WAF 拦截 (含 "sh" 子串)
+[发现9] mysql --execute 无法产生 stdout 输出 (auth/输出模式问题)
+[发现10] mysql --version 可正常工作 (不需要连接)
+[发现11] mysqldump --user=root --password=root ctf 显示空数据库(无表)
+[发现12] mysqldump --all-databases 转储所有数据库 → 发现 PHP_CMS 库
+[发现13] PHP_CMS.F1ag_Se3Re7 表含 flag66_2024 列
+[⭐⭐⭐ FLAG] ctfshow{ff9f699c-e2af-4e32-bef1-5aa1de556684}
