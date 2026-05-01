@@ -369,14 +369,145 @@ def _recover_agent(session: str, agent_id: str) -> None:
     log(f"🔄 自动恢复 {agent_id}（API 错误后重试）")
 
 
-def _build_wakeup_context() -> str:
-    """构建唤醒消息：纯通知，不夹带任何数据。"""
-    return (
-        "=== 系统通知 ===\n"
-        "成员发现已更新，请读取各成员的 findings.txt 了解最新进展。\n"
-        "根据情况通过 advice_memberX.txt 进行针对性指挥。\n"
-        "写入后调度器会强制打断对应成员。"
-    )
+# ── 被动捕获：观察 agent 操作 ──────────────────────
+
+_OBSERVATION_NOISE = (
+    'skip this response', 'choose response', '(shift+tab to cycle)',
+    'esc to interrupt', 'bypass permissions', 'paste again to expand',
+    'Press up to edit', 'current work', 'Press up to edit queued messages',
+    '/btw', 'Use /btw',
+)
+
+# Thinking animation words — used in _is_noise but overridden when line has timing info
+_THINKING_NOISE = (
+    'Scampering', 'Sprouting', 'Computing', 'Frolicking', 'Bootstrapping',
+    'Analyzing', 'Swirling', 'Composing', 'Billowing', 'Brewing',
+    'Catapulting', 'Flibbertigibbeting', 'Manifesting', 'Twisting',
+    'Photosynthesizing', 'Improvising', 'Sock-hopping', 'Razzmatazzing',
+    'Nucleating', 'Metamorphosing', 'Crunching', 'Nesting', 'Sprouting',
+    'still thinking', 'thinking more', 'thinking some more', 'almost done thinking',
+    'Baked for', 'Brewed for',
+)
+
+
+def _is_noise(line: str) -> bool:
+    """Check if a line is noise (empty, separator, thinking indicator, UI chrome)."""
+    if not line.strip():
+        return True
+    stripped = line.strip()
+    if stripped in ('────────────────────────────────────────────────────────────────────────────────', '---'):
+        return True
+    if stripped.startswith('⎿') or stripped.startswith('▌'):
+        return True
+    if stripped == '❯' or stripped.startswith('⏵⏵'):
+        return True
+    for kw in _OBSERVATION_NOISE:
+        if kw.lower() in stripped.lower():
+            return True
+    for kw in _THINKING_NOISE:
+        if kw.lower() in stripped.lower():
+            return True
+    return False
+
+
+def _extract_new_output(old: str, new: str) -> list[str]:
+    """Diffs old/new pane content to find meaningful new lines.
+
+    Handles both normal content appending and tmux buffer wrap-around
+    (when old lines scroll off the top)."""
+    if new == old:
+        return []
+    old_lines = old.split('\n')
+    new_lines = new.split('\n')
+    meaningful = []
+
+    # Walk backwards from end to find shared suffix
+    match_len = 0
+    while (match_len < len(old_lines) and match_len < len(new_lines)
+           and old_lines[len(old_lines) - 1 - match_len] == new_lines[len(new_lines) - 1 - match_len]):
+        match_len += 1
+
+    # Everything before the matching suffix in new_lines is "new"
+    end = len(new_lines) - match_len
+    for i in range(end):
+        if not _is_noise(new_lines[i]):
+            meaningful.append(new_lines[i].strip())
+    return meaningful
+
+
+def _capture_observations(session: str, member_id: str, prev_content: dict[str, str]) -> tuple[str, bool]:
+    """Capture new output from a member's pane and save to observations.txt.
+    Returns (new_content, has_meaningful)."""
+    try:
+        new_content = _capture_pane(session, member_id)
+        old_content = prev_content.get(member_id, '')
+        if old_content and new_content != old_content:
+            new_lines = _extract_new_output(old_content, new_content)
+            if new_lines:
+                obs_path = PROJECT_DIR / "bus" / member_id / "observations.txt"
+                timestamp = time.strftime('%H:%M:%S')
+                for line in new_lines:
+                    entry = f'[{timestamp}] {line}\n'
+                    with open(obs_path, 'a') as f:
+                        f.write(entry)
+                return new_content, True
+        return new_content, False
+    except Exception:
+        return prev_content.get(member_id, ''), False
+
+
+def _build_observations_summary(member_id: str, max_lines: int = 15) -> str:
+    """Read the last N lines of a member's observations file."""
+    obs_path = PROJECT_DIR / "bus" / member_id / "observations.txt"
+    if not obs_path.exists():
+        return ''
+    lines = obs_path.read_text(encoding='utf-8').strip().split('\n')
+    recent = lines[-max_lines:]
+    return '\n'.join(recent)
+
+
+def _capture_member_status(session: str, member_id: str) -> str:
+    """Capture the current status line from a member's pane (first non-noise line from bottom)."""
+    try:
+        content = _capture_pane(session, member_id)
+        lines = content.split('\n')
+        for line in reversed(lines):
+            stripped = line.strip()
+            if stripped and not _is_noise(stripped):
+                return stripped
+        return '(unknown)'
+    except Exception:
+        return '(unknown)'
+
+
+def _build_wakeup_context(session: str, bus: FileMessageBus) -> str:
+    """构建唤醒消息：包含队员 findings + 调度器捕获的操作记录 + 实时状态。"""
+    parts = ["=== 系统通知 ===\n成员有新进展，请综合以下信息决策：\n"]
+
+    for mid in ("member1", "member2", "member3"):
+        finding = bus.get_finding(mid)
+        if finding:
+            preview = finding.strip().split('\n')[:10]
+            parts.append(f"\n[{mid}]:")
+            parts.extend(f"  {l}" for l in preview)
+
+    # 实时状态（即使队员在长思考也捕获当前行）
+    parts.append("\n【当前状态】")
+    for mid in ("member1", "member2", "member3"):
+        status = _capture_member_status(session, mid)
+        if status:
+            parts.append(f"  {mid}: {status}")
+
+    for mid in ("member1", "member2", "member3"):
+        obs = _build_observations_summary(mid)
+        if obs:
+            parts.append(f"\n【{mid} 操作记录】")
+            parts.append(obs)
+
+    parts.append("\n---")
+    parts.append("根据情况通过 advice_memberX.txt 进行针对性指挥。")
+    parts.append("写入后调度器会强制打断对应成员。")
+    return "\n".join(parts)
 
 
 def _wake_agent(session: str, agent_id: str, message: str) -> None:
@@ -570,7 +701,10 @@ def _run_scheduler(config: dict, bus: FileMessageBus, session: str) -> None:
     _findings_mtimes: dict[str, float] = {}
     _advice_txt_mtime: float = 0.0
     _advice_mtimes: dict[str, float] = {}
-    _findings_dirty: dict[str, bool] = {}
+    _pending_leader_notify = False
+    _prev_pane_contents: dict[str, str] = {}
+    _last_heartbeat_ts = 0.0
+    _HEARTBEAT_INTERVAL = 120.0  # 每 120s 推送状态心跳给队长
     _last_leader_wake = 0.0
     _last_member_wake: dict[str, float] = {}
     # API 错误自动恢复跟踪
@@ -587,7 +721,6 @@ def _run_scheduler(config: dict, bus: FileMessageBus, session: str) -> None:
         _findings_mtimes[mid] = fp.stat().st_mtime if fp.exists() else 0
         ap = bus.bus_dir / "leader" / f"advice_{mid}.txt"
         _advice_mtimes[mid] = ap.stat().st_mtime if ap.exists() else 0
-        _findings_dirty[mid] = False
         _agent_error_counts[mid] = 0
         _last_agent_recovery[mid] = 0.0
     _agent_error_counts["leader"] = 0
@@ -635,22 +768,22 @@ def _run_scheduler(config: dict, bus: FileMessageBus, session: str) -> None:
 
             now_mono = time.monotonic()
 
-            # ── 监测 findings 变化 → 标记 dirty → 唤醒 leader ──
+            # ── 监测 findings 变化 → 标记待通知 → 唤醒 leader ──
             for mid in ("member1", "member2", "member3"):
                 fp = bus.bus_dir / mid / "findings.txt"
                 cur = fp.stat().st_mtime if fp.exists() else 0
-                if cur != _findings_mtimes[mid]:
+                prev = _findings_mtimes.get(mid, -1)
+                if cur != prev:
                     _findings_mtimes[mid] = cur
-                    _findings_dirty[mid] = True
+                    _pending_leader_notify = True
 
-            if any(_findings_dirty.values()):
+            if _pending_leader_notify:
                 if now_mono - _last_leader_wake >= _MIN_WAKEUP_INTERVAL:
                     if _is_agent_idle(session, "leader"):
                         _wake_agent(session, "leader",
-                            _build_wakeup_context())
+                            _build_wakeup_context(session, bus))
                         _last_leader_wake = now_mono
-                        for mid in ("member1", "member2", "member3"):
-                            _findings_dirty[mid] = False
+                        _pending_leader_notify = False
                         log("唤醒 leader（新发现）")
 
             # ── 监测 advice.txt 变化 → 广播全局策略给所有成员 ──
@@ -665,12 +798,36 @@ def _run_scheduler(config: dict, bus: FileMessageBus, session: str) -> None:
             for mid in ("member1", "member2", "member3"):
                 ap = bus.bus_dir / "leader" / f"advice_{mid}.txt"
                 cur = ap.stat().st_mtime if ap.exists() else 0
-                if cur != _advice_mtimes[mid]:
+                prev = _advice_mtimes.get(mid, -1)
+                if cur != prev:
                     _advice_mtimes[mid] = cur
                     if now_mono - _last_member_wake.get(mid, 0) >= _MIN_WAKEUP_INTERVAL:
                         _force_push_targeted_advice(session, mid)
                         _last_member_wake[mid] = now_mono
                         log(f"强制打断 {mid}（新建议）")
+
+            # ── 被动捕获操作记录 ──
+            has_new_obs = False
+            for mid in ("member1", "member2", "member3"):
+                new_content, meaningful = _capture_observations(session, mid, _prev_pane_contents)
+                _prev_pane_contents[mid] = new_content
+                if meaningful:
+                    has_new_obs = True
+
+            if has_new_obs and not _pending_leader_notify:
+                if now_mono - _last_leader_wake >= _MIN_WAKEUP_INTERVAL:
+                    _pending_leader_notify = True
+                    log("捕获操作记录，待通知队长")
+
+            # ── 状态心跳：长思考无产出时仍通知队长 ──
+            if (now_mono - _last_heartbeat_ts >= _HEARTBEAT_INTERVAL
+                    and now_mono - _last_leader_wake >= _MIN_WAKEUP_INTERVAL):
+                _last_heartbeat_ts = now_mono
+                if _is_agent_idle(session, "leader"):
+                    _wake_agent(session, "leader",
+                        _build_wakeup_context(session, bus))
+                    _last_leader_wake = now_mono
+                    log("状态心跳唤醒 leader")
 
             # ── Agent 健康检测：API 错误自动恢复 ──
             for agent_id in ("leader", "member1", "member2", "member3"):
