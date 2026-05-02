@@ -3,3 +3,11 @@ __pycache__/
 .prompt_*.md
 bus/
 *.output
+# Agent runtime generated scripts
+exploit*.py
+probe*.py
+local_test*.py
+remote_debug*.py
+reconnect*.py
+precise_probe*.py
+reattach_scheduler*.py

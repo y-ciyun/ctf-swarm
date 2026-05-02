@@ -182,71 +182,67 @@ def _start_one_agent(session: str, agent_id: str, agent_type: str,
 
     # Create window
     subprocess.run(["tmux", "new-window", "-t", session, "-n", window_name],
-                   check=True, timeout=10)
+                   capture_output=True, timeout=10)
 
     # Start claude
     claude_path = "/home/yy/.nvm/versions/node/v24.15.0/bin/claude"
     startup = f"cd {PROJECT_DIR} && {env_exports} && export PATH=/home/yy/.nvm/versions/node/v24.15.0/bin:$PATH && {claude_path} --bare --permission-mode bypassPermissions"
     subprocess.run(["tmux", "send-keys", "-t", f"{session}:{window_name}",
-                    startup, "Enter"], check=True, timeout=10)
+                    startup, "Enter"], capture_output=True, timeout=10)
 
-    # ── 处理 claude 启动时的所有交互提示 ──
-    # 可能出现的提示（顺序不定）：
-    #   1. API key:    "Do you want to use this API key?"  → Up+Enter (选 Yes)
-    #   2. Trust:      "trust this folder" / "Yes, I trust" → Enter (默认 Yes)
-    #   3. Bypass:     "Bypass Permissions" / "No, exit"   → Down+Enter
-    #   4. 就绪:       "Claude Code" 或 "❯" prompt
+    # ── 快速处理启动对话框（不超过 15 秒） ──
+    # 可能出现的提示：
+    #   1. Bypass:     "Bypass Permissions" → Down+Enter
+    #   2. API key:    "Do you want to use this API key?" → Up+Enter
+    #   3. Trust:      "trust this folder" → Enter
     #
-    READY_PATTERNS = [r"Claude Code", r"❯"]
+    # 注意：不等待 claude 完全就绪（首次启动可能需 60s+）。
+    # 处理完对话框后即粘贴 prompt 返回，调度器后续处理 readiness。
+    BYPASS_PATTERNS = [r"WARNING:.*Bypass Permissions", r"No, exit"]
     API_KEY_PATTERN = [r"Do you want to use this API"]
     TRUST_PATTERNS = [r"trust this folder", r"Yes, I trust"]
-    # 注意：不要只匹配 "bypassPermissions"——这个字符串也出现在 bash 命令中！
-    BYPASS_PATTERNS = [r"WARNING:.*Bypass Permissions", r"No, exit"]
 
-    deadline = time.monotonic() + 50  # total max 50s per agent
-    sent_enter_for_trust = False
-    sent_up_for_apikey = False
     sent_down_for_bypass = False
+    sent_up_for_apikey = False
+    sent_enter_for_trust = False
 
-    while time.monotonic() < deadline:
+    time.sleep(2)  # 给 claude 渲染对话框的时间
+
+    dialog_deadline = time.monotonic() + 15
+    while time.monotonic() < dialog_deadline:
         content = _capture_pane(session, window_name)
 
-        # Check if claude is ready
-        if _has_any(content, READY_PATTERNS):
-            time.sleep(2)  # wait for prompt to fully render
-            break
-
-        # Handle prompts (check all in each iteration)
-        if not sent_up_for_apikey and _has_any(content, API_KEY_PATTERN):
-            subprocess.run(["tmux", "send-keys", "-t", f"{session}:{window_name}",
-                            "Up", "Enter"], check=True, timeout=10)
-            sent_up_for_apikey = True
-            log(f"[{agent_id}] api key accepted")
-            time.sleep(1)
-
-        if not sent_enter_for_trust and _has_any(content, TRUST_PATTERNS):
-            subprocess.run(["tmux", "send-keys", "-t", f"{session}:{window_name}",
-                            "Enter"], check=True, timeout=10)
-            sent_enter_for_trust = True
-            log(f"[{agent_id}] trust accepted")
-            time.sleep(1)
-
         if not sent_down_for_bypass and _has_any(content, BYPASS_PATTERNS):
-            # Send Down first, then Enter separately
             subprocess.run(["tmux", "send-keys", "-t", f"{session}:{window_name}",
-                            "Down"], check=True, timeout=10)
+                            "Down"], capture_output=True, timeout=5)
             time.sleep(0.3)
             subprocess.run(["tmux", "send-keys", "-t", f"{session}:{window_name}",
-                            "Enter"], check=True, timeout=10)
+                            "Enter"], capture_output=True, timeout=5)
             sent_down_for_bypass = True
             log(f"[{agent_id}] bypass accepted")
             time.sleep(1)
+            continue
 
-        # None matched, wait and retry
-        time.sleep(0.5)
+        if not sent_up_for_apikey and _has_any(content, API_KEY_PATTERN):
+            subprocess.run(["tmux", "send-keys", "-t", f"{session}:{window_name}",
+                            "Up", "Enter"], capture_output=True, timeout=5)
+            sent_up_for_apikey = True
+            log(f"[{agent_id}] api key accepted")
+            time.sleep(1)
+            continue
+
+        if not sent_enter_for_trust and _has_any(content, TRUST_PATTERNS):
+            subprocess.run(["tmux", "send-keys", "-t", f"{session}:{window_name}",
+                            "Enter"], capture_output=True, timeout=5)
+            sent_enter_for_trust = True
+            log(f"[{agent_id}] trust accepted")
+            time.sleep(1)
+            continue
+
+        # 没有对话框了，停止扫描
+        break
     else:
-        log(f"[{agent_id}] WARNING: claude did not become ready in time")
-        return False
+        log(f"[{agent_id}] dialog handling timed out")
 
     # Paste the prompt
     prompt_text = prompt_file.read_text(encoding="utf-8")
@@ -263,8 +259,9 @@ def _start_one_agent(session: str, agent_id: str, agent_type: str,
     # 检查 paste-buffer 是否被折叠
     content = _capture_pane(session, window_name)
     if "paste again to expand" in content.lower():
-        log(f"[{agent_id}] paste-buffer 被折叠，改用 send-keys 逐行输入")
-        _send_keys_typed(session, window_name, prompt_text)
+        log(f"[{agent_id}] paste-buffer 被折叠，回车展开")
+        # 直接回车展开粘贴内容，避免 send-keys 逐行发送拆散消息
+        time.sleep(0.3)
 
     time.sleep(0.5)
 
@@ -357,8 +354,8 @@ def _is_agent_idle(session: str, agent_id: str) -> bool:
             for indicator in thinking_indicators:
                 if indicator.lower() in stripped.lower():
                     return False
-            # ❯ in any position means idle (it's the prompt marker)
-            if '❯' in stripped:
+            # ❯ 单独一行才是真正的 idle prompt（避免误匹配菜单中的 "❯ 1. No, exit"）
+            if stripped == '❯':
                 return True
             # Any other meaningful content without ❯ means not idle
             return False
@@ -575,6 +572,13 @@ def _wake_agent(session: str, agent_id: str, message: str) -> None:
 
     paste-buffer 被折叠时直接回车展开粘贴内容，确保消息完整发送。
     """
+    # 0. 存活检测：如果 claude 已退出，跳过发送
+    content = _capture_pane(session, agent_id)
+    if '└─$' in content or 'bash' in content or 'zsh' in content:
+        if '❯' not in content:
+            log(f"WARNING: {agent_id} 已退出到 shell，跳过唤醒")
+            return
+
     # 1. Esc 确保回到干净 prompt（打断思考 / 清 queued messages）
     subprocess.run(["tmux", "send-keys", "-t", f"{session}:{agent_id}", "Escape"],
                    capture_output=True, timeout=5)
@@ -657,8 +661,8 @@ def _force_push_message(session: str, member_id: str, msg: str, buf_suffix: str 
     # Verify: paste-buffer often gets collapsed to "paste again to expand"
     content = _capture_pane(session, member_id)
     if "paste again to expand" in content.lower():
-        _send_keys_typed(session, member_id, msg)
-        time.sleep(0.5)
+        # 直接回车展开粘贴内容，避免拆散消息
+        time.sleep(0.3)
 
     # 检查是否被 queue，需要 Up 提交
     content = _capture_pane(session, member_id)
@@ -821,29 +825,44 @@ def _scan_panes_for_flag(session: str) -> tuple[str | None, str | None]:
 
 def _run_scheduler(config: dict, bus: FileMessageBus, session: str) -> None:
     """永久调度循环：监视文件 mtime 变化 → 唤醒对应 agent。不做判断，不做转述。"""
-    # ── ObservationBuffer：积累 observations → 适当时机推送给 leader ──
+    # ── ObservationBuffer：积累 observations + findings → 适当时机推送给 leader ──
     class ObservationBuffer:
-        """积累成员的 observations，在 leader 空闲时推送。
+        """积累成员的 observations 和 findings 变化，leader 空闲时推送。
 
         推送策略（避免频繁打断 leader）：
-        - 等待 advice.txt 写入后再开始推送，给 leader 完成战略部署的时间
+        - 启动后前 90s 为安静期：只积累，不推送（给 leader 思考时间）
         - 最小间隔 90 秒，让 leader 有时间思考与写建议
-        - 积累 20 条或 6 轮再推送，减少琐碎干扰
+        - 积累 20 条观察或 6 轮再推送，减少琐碎干扰
+        - findings 变化作为单独标记嵌入消息，帮助 leader 了解关键进展
         - 内容去重：如果内容与上次推送基本相同，跳过
-        - 强制打断阈值提高到 40 条 / 15 轮（避免 leader 无限期忙导致丢消息）
+        - 强制打断阈值 40 条 / 15 轮（避免 leader 无限期忙导致丢消息）
         """
         _MIN_INTERVAL = 90.0       # 最短推送间隔（秒）
         _FLUSH_MIN_ITEMS = 20       # buffer 满多少条就推送
         _FLUSH_MIN_ROUNDS = 6       # 积累多少轮就推送
         _FORCE_MAX_ITEMS = 40       # 堆积到上限强制打断 leader
         _FORCE_MAX_ROUNDS = 15      # 积累上限轮次强制打断
+        _STARTUP_GRACE = 90.0       # 启动后安静期（秒），让 leader 先思考
 
         def __init__(self):
             self._buffer: dict[str, list[tuple[str, str]]] = {}
             self._rounds = 0
             self._last_flush = 0.0
-            self._last_body_hash = ''  # 上次推送内容的 hash，用于去重
-            self._advice_seen = False  # advice.txt 是否已被调度器检测到
+            self._last_body_hash = ''
+            self._startup_grace_until = time.monotonic() + self._STARTUP_GRACE
+            # Findings 变化跟踪
+            self._prev_findings_hashes: dict[str, str] = {}
+            self._findings_changed: set[str] = set()
+            # 最新 findings 内容快照（用于构建消息）
+            self._latest_findings: dict[str, str] = {}
+
+        def check_findings(self, member_id: str, content: str) -> None:
+            """注册 findings 变化，由调度器在检测到 mtime 变化时调用。"""
+            prev = self._prev_findings_hashes.get(member_id, '')
+            self._prev_findings_hashes[member_id] = content
+            if content.strip() and content != prev:
+                self._findings_changed.add(member_id)
+                self._latest_findings[member_id] = content
 
         def add(self, member_id: str, lines: list[str]) -> None:
             ts = time.strftime('%H:%M:%S')
@@ -865,28 +884,30 @@ def _run_scheduler(config: dict, bus: FileMessageBus, session: str) -> None:
                     lines_out.append(f"[{mid}]: {len(entries)}条")
                     for ts, line in entries[-5:]:
                         lines_out.append(f"  [{ts}] {line[:120]}")
+                if mid in self._findings_changed:
+                    lines_out.append(f"  * findings 有更新")
             return '\n'.join(lines_out)
-
-        def mark_advice_seen(self) -> None:
-            """标记 advice.txt 已被调度器检测并广播，此后观察推送才启动。"""
-            self._advice_seen = True
 
         def decide(self, now_mono: float, leader_idle: bool) -> str | None:
             """决策是否推送。返回消息字符串(需推送)或 None(继续积累)。"""
-            if self._total == 0:
+            if self._total == 0 and not self._findings_changed:
                 self._rounds = 0
                 return None
 
             elapsed = now_mono - self._last_flush
 
-            # 强制打断：堆积过多（不受 advice_seen 影响，避免 buffer 无限膨胀）
-            if self._total >= self._FORCE_MAX_ITEMS or self._rounds >= self._FORCE_MAX_ROUNDS:
-                return self._build(now_mono)
-
-            # 等待 leader 写完 advice.txt 后再推送，避免打断战略部署
-            if not self._advice_seen:
+            # 启动安静期：只积累不推送，让 leader 先思考
+            if now_mono < self._startup_grace_until:
                 self._rounds += 1
+                if self._rounds > 999:
+                    for mid in self._buffer:
+                        half = len(self._buffer[mid]) // 2
+                        self._buffer[mid] = self._buffer[mid][half:]
                 return None
+
+            # 强制打断：堆积过多（leader 长时间思考未响应）
+            if self._total >= self._FORCE_MAX_ITEMS or self._rounds >= self._FORCE_MAX_ROUNDS:
+                return self._build(now_mono, force=True)
 
             # Leader 忙 → 只积累，不推送
             if not leader_idle:
@@ -905,20 +926,40 @@ def _run_scheduler(config: dict, bus: FileMessageBus, session: str) -> None:
                 return None
 
             self._rounds += 1
-            if self._total >= self._FLUSH_MIN_ITEMS or self._rounds >= self._FLUSH_MIN_ROUNDS:
+            if (self._total >= self._FLUSH_MIN_ITEMS
+                    or self._rounds >= self._FLUSH_MIN_ROUNDS
+                    or self._findings_changed):
                 return self._build(now_mono)
 
             return None
 
-        def _build(self, now_mono: float) -> str:
-            parts = [f"【观测积累 — 共 {self._total} 条新活动】"]
-            for mid in ("member1", "member2", "member3"):
-                entries = self._buffer.get(mid, [])
-                if entries:
+        def _build(self, now_mono: float, force: bool = False) -> str:
+            parts = []
+            tag = "【强制打断】" if force else "【系统更新】"
+            parts.append(f"{tag} — 共 {self._total} 条新活动")
+
+            # 1) Findings 变化（高优先级）
+            if self._findings_changed:
+                parts.append("\n📋 findings 更新:")
+                for mid in sorted(self._findings_changed):
+                    content = self._latest_findings.get(mid, '')
+                    preview = content.strip().split('\n')[:5]
                     parts.append(f"  [{mid}]:")
-                    for ts, line in entries[-5:]:
-                        parts.append(f"    [{ts}] {line[:120]}")
-                    self._buffer[mid] = []
+                    for l in preview:
+                        parts.append(f"    {l.strip()[:120]}")
+                self._findings_changed.clear()
+
+            # 2) Observations（低优先级）
+            if self._total > 0:
+                parts.append(f"\n👀 终端活动观察:")
+                for mid in ("member1", "member2", "member3"):
+                    entries = self._buffer.get(mid, [])
+                    if entries:
+                        parts.append(f"  [{mid}] ({len(entries)}条):")
+                        for ts, line in entries[-5:]:
+                            parts.append(f"    [{ts}] {line}")
+                        self._buffer[mid] = []
+
             self._last_flush = now_mono
             self._rounds = 0
             self._last_body_hash = ''
@@ -930,7 +971,6 @@ def _run_scheduler(config: dict, bus: FileMessageBus, session: str) -> None:
     _findings_mtimes: dict[str, float] = {}
     _advice_txt_mtime: float = 0.0
     _advice_mtimes: dict[str, float] = {}
-    _pending_leader_notify = False
     _last_heartbeat_ts = 0.0
     _HEARTBEAT_INTERVAL = 180.0  # 每 180s 向队长同步队员状态
     _STALE_THRESHOLD = 300.0    # 成员 findings 超过 5 分钟无变化视为卡死
@@ -1006,29 +1046,22 @@ def _run_scheduler(config: dict, bus: FileMessageBus, session: str) -> None:
 
             now_mono = time.monotonic()
 
-            # ── 监测 findings 变化 → 标记待通知 → 唤醒 leader ──
+            # ── 监测 findings 变化 → 更新 hash + 喂入 ObservationBuffer ──
+            # 不再直接唤醒 leader，改为积累后统一推送
             for mid in ("member1", "member2", "member3"):
                 fp = bus.bus_dir / mid / "findings.txt"
                 cur = fp.stat().st_mtime if fp.exists() else 0
                 prev = _findings_mtimes.get(mid, -1)
                 if cur != prev:
                     _findings_mtimes[mid] = cur
-                    _pending_leader_notify = True
-                    # 更新 content hash 用于卡死检测
                     try:
-                        _findings_hashes[mid] = fp.read_text(encoding='utf-8')
+                        new_content = fp.read_text(encoding='utf-8')
+                        _findings_hashes[mid] = new_content
+                        _obs_buffer.check_findings(mid, new_content)
                     except Exception:
-                        _findings_hashes[mid] = ''
+                        new_content = ''
+                        _findings_hashes[mid] = new_content
                     _last_stale_warn[mid] = now_mono
-
-            if _pending_leader_notify:
-                if now_mono - _last_leader_wake >= _MIN_WAKEUP_INTERVAL:
-                    if _is_agent_idle(session, "leader"):
-                        _wake_agent(session, "leader",
-                            _build_wakeup_context(session, bus))
-                        _last_leader_wake = now_mono
-                        _pending_leader_notify = False
-                        log("唤醒 leader（新发现）")
 
             # ── 监测 advice.txt 变化 → 广播全局策略给所有成员 ──
             ap_txt = bus.bus_dir / "leader" / "advice.txt"
@@ -1036,7 +1069,6 @@ def _run_scheduler(config: dict, bus: FileMessageBus, session: str) -> None:
             if cur_txt and cur_txt != _advice_txt_mtime:
                 _advice_txt_mtime = cur_txt
                 _force_push_broadcast_advice(session)
-                _obs_buffer.mark_advice_seen()  # 激活观察推送
                 log("广播全局策略（advice.txt）")
 
             # ── 监测 advice_memberX.txt 变化 → 强制打断对应成员 ──
