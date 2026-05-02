@@ -867,6 +867,10 @@ def _run_scheduler(config: dict, bus: FileMessageBus, session: str) -> None:
                         lines_out.append(f"  [{ts}] {line[:120]}")
             return '\n'.join(lines_out)
 
+        def mark_advice_seen(self) -> None:
+            """标记 advice.txt 已被调度器检测并广播，此后观察推送才启动。"""
+            self._advice_seen = True
+
         def decide(self, now_mono: float, leader_idle: bool) -> str | None:
             """决策是否推送。返回消息字符串(需推送)或 None(继续积累)。"""
             if self._total == 0:
@@ -875,9 +879,14 @@ def _run_scheduler(config: dict, bus: FileMessageBus, session: str) -> None:
 
             elapsed = now_mono - self._last_flush
 
-            # 强制打断：堆积过多（不受内容去重影响）
+            # 强制打断：堆积过多（不受 advice_seen 影响，避免 buffer 无限膨胀）
             if self._total >= self._FORCE_MAX_ITEMS or self._rounds >= self._FORCE_MAX_ROUNDS:
                 return self._build(now_mono)
+
+            # 等待 leader 写完 advice.txt 后再推送，避免打断战略部署
+            if not self._advice_seen:
+                self._rounds += 1
+                return None
 
             # Leader 忙 → 只积累，不推送
             if not leader_idle:
@@ -1027,6 +1036,7 @@ def _run_scheduler(config: dict, bus: FileMessageBus, session: str) -> None:
             if cur_txt and cur_txt != _advice_txt_mtime:
                 _advice_txt_mtime = cur_txt
                 _force_push_broadcast_advice(session)
+                _obs_buffer.mark_advice_seen()  # 激活观察推送
                 log("广播全局策略（advice.txt）")
 
             # ── 监测 advice_memberX.txt 变化 → 强制打断对应成员 ──
