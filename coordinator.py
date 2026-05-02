@@ -62,18 +62,26 @@ def parse_challenge_input(text: str) -> dict:
     if urls:
         info["url"] = urls[0]
         info["_type"] = "url"
+        # 有 URL 时不再尝试本地路径检测
+        return info
 
+    # 仅在输入明确指向本地文件时检测（不再从描述文本中 regex 猜测）
     for w in text_stripped.split():
-        w = w.strip("'\"(),.。，")
-        p = Path(w).expanduser().resolve()
-        if p.exists():
-            if p.is_dir():
-                info["dir"] = str(p)
-                info["_type"] = "dir"
-            else:
-                info["file"] = str(p)
-                info["_type"] = "file"
-            break
+        w = w.strip("'\"(),.。，：:")
+        if not w.startswith('/') and not w.startswith('.'):
+            continue  # 只处理以 / 或 . 开头的路径
+        try:
+            p = Path(w).expanduser().resolve()
+            if p.exists():
+                if p.is_dir():
+                    info["dir"] = str(p)
+                    info["_type"] = "dir"
+                else:
+                    info["file"] = str(p)
+                    info["_type"] = "file"
+                break
+        except (OSError, ValueError):
+            continue
 
     return info
 
@@ -178,7 +186,7 @@ def _start_one_agent(session: str, agent_id: str, agent_type: str,
 
     # Start claude
     claude_path = "/home/yy/.nvm/versions/node/v24.15.0/bin/claude"
-    startup = f"cd {PROJECT_DIR} && {env_exports} && export PATH=/home/yy/.nvm/versions/node/v24.15.0/bin:$PATH && {claude_path} --permission-mode bypassPermissions"
+    startup = f"cd {PROJECT_DIR} && {env_exports} && export PATH=/home/yy/.nvm/versions/node/v24.15.0/bin:$PATH && {claude_path} --bare --permission-mode bypassPermissions"
     subprocess.run(["tmux", "send-keys", "-t", f"{session}:{window_name}",
                     startup, "Enter"], check=True, timeout=10)
 
@@ -250,7 +258,15 @@ def _start_one_agent(session: str, agent_id: str, agent_type: str,
          "-t", f"{session}:{window_name}", "-d"],
         check=True, timeout=10,
     )
-    time.sleep(1.5)
+    time.sleep(1.0)
+
+    # 检查 paste-buffer 是否被折叠
+    content = _capture_pane(session, window_name)
+    if "paste again to expand" in content.lower():
+        log(f"[{agent_id}] paste-buffer 被折叠，改用 send-keys 逐行输入")
+        _send_keys_typed(session, window_name, prompt_text)
+
+    time.sleep(0.5)
 
     # Submit
     subprocess.run(["tmux", "send-keys", "-t", f"{session}:{window_name}",
@@ -311,26 +327,42 @@ _MAX_RECOVERY_RETRIES = 3        # 单个 agent 最大自动重试次数
 
 
 def _is_agent_idle(session: str, agent_id: str) -> bool:
-    """检测 agent 是否真正 idle（❯ 提示符可见 + 无思考动画）。只检查最近 5 行。"""
+    """Scan from bottom of pane — if the first meaningful content is ❯, agent is idle.
+
+    Chrome lines (separators, status bar, tips) are skipped. Active thinking
+    indicators (present-continuous verbs, "still thinking", etc.) mean NOT idle.
+    Past-tense summaries like "Brewed for" remain in the buffer after ❯ appears
+    and are ignored — ❯ is the signal.
+    """
     try:
         content = _capture_pane(session, agent_id)
         lines = content.split('\n')
-        recent = lines[-5:]
-        # 必须看到 ❯ 提示符（可能后面跟着 "Press up to edit"）
-        has_prompt = any('❯' in line for line in recent)
-        if not has_prompt:
-            return False
-        # 不能有思考/工作中动画
         thinking_indicators = (
             'still thinking', 'thinking more', 'Sprouting', 'Computing',
-            'Razzmatazzing', 'Brewed for', 'Bootstrapping', 'Analyzing',
+            'Razzmatazzing', 'Bootstrapping', 'Analyzing',
             'Swirling', 'Composing', 'Billowing', 'Brewing',
+            'Schlepping', 'Cogitating', 'Cultivating', 'Churning',
+            'Photosynthesizing', 'Whirlpooling', 'Beboppin', 'Sautéed',
         )
-        for line in recent:
+        for line in reversed(lines):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            # UI chrome — skip
+            if stripped.startswith('⏵⏵') or stripped.startswith('⎿') or stripped.startswith('▌'):
+                continue
+            if set(stripped) == {'─'} or stripped == '---':
+                continue
+            # Active thinking — not idle
             for indicator in thinking_indicators:
-                if indicator.lower() in line.lower():
+                if indicator.lower() in stripped.lower():
                     return False
-        return True
+            # ❯ in any position means idle (it's the prompt marker)
+            if '❯' in stripped:
+                return True
+            # Any other meaningful content without ❯ means not idle
+            return False
+        return False
     except Exception:
         return False
 
@@ -376,6 +408,14 @@ _OBSERVATION_NOISE = (
     'esc to interrupt', 'bypass permissions', 'paste again to expand',
     'Press up to edit', 'current work', 'Press up to edit queued messages',
     '/btw', 'Use /btw',
+    # curl output noise
+    'URL encoding', 'special characters', 'curl -s', 'curl -v', 'curl -i',
+    'user_agent', 'Content-Type', 'Accept:', 'text/html', 'text/plain',
+    'HTTP/1.1', 'HTTP/2', 'Server:', 'Date:', 'X-Powered-By',
+    # command echo noise
+    'echo "', "echo '", 'esac', ';;', ';; esac',
+    # ===== separator lines
+    '===========', '----------', '_________',
 )
 
 # Thinking animation words — used in _is_noise but overridden when line has timing info
@@ -410,50 +450,57 @@ def _is_noise(line: str) -> bool:
     return False
 
 
-def _extract_new_output(old: str, new: str) -> list[str]:
-    """Diffs old/new pane content to find meaningful new lines.
+_OBS_SEEN_CACHE: dict[str, set[str]] = {}  # member_id → set of already-captured line hashes
 
-    Handles both normal content appending and tmux buffer wrap-around
-    (when old lines scroll off the top)."""
-    if new == old:
-        return []
-    old_lines = old.split('\n')
-    new_lines = new.split('\n')
-    meaningful = []
+def _capture_observations(session: str, member_id: str, _unused: dict | None = None) -> tuple[str, bool, list[str]]:
+    """捕获 pane 中未记录过的有意义行。
 
-    # Walk backwards from end to find shared suffix
-    match_len = 0
-    while (match_len < len(old_lines) and match_len < len(new_lines)
-           and old_lines[len(old_lines) - 1 - match_len] == new_lines[len(new_lines) - 1 - match_len]):
-        match_len += 1
-
-    # Everything before the matching suffix in new_lines is "new"
-    end = len(new_lines) - match_len
-    for i in range(end):
-        if not _is_noise(new_lines[i]):
-            meaningful.append(new_lines[i].strip())
-    return meaningful
-
-
-def _capture_observations(session: str, member_id: str, prev_content: dict[str, str]) -> tuple[str, bool]:
-    """Capture new output from a member's pane and save to observations.txt.
-    Returns (new_content, has_meaningful)."""
+    tmux pane 固定高度（24行），新输出会顶掉旧行，因此不能靠行号增量。
+    改用内容去重：只返回未在 observations.txt 中出现过的行。
+    返回 (content, has_new, meaningful_lines)。"""
     try:
-        new_content = _capture_pane(session, member_id)
-        old_content = prev_content.get(member_id, '')
-        if old_content and new_content != old_content:
-            new_lines = _extract_new_output(old_content, new_content)
-            if new_lines:
-                obs_path = PROJECT_DIR / "bus" / member_id / "observations.txt"
-                timestamp = time.strftime('%H:%M:%S')
-                for line in new_lines:
-                    entry = f'[{timestamp}] {line}\n'
-                    with open(obs_path, 'a') as f:
-                        f.write(entry)
-                return new_content, True
-        return new_content, False
+        content = _capture_pane(session, member_id)
+        lines = content.split('\n')
+
+        # 首轮初始化
+        if member_id not in _OBS_SEEN_CACHE:
+            _OBS_SEEN_CACHE[member_id] = set()
+            # 加载已持久化的行，避免重复
+            obs_path = PROJECT_DIR / "bus" / member_id / "observations.txt"
+            if obs_path.exists():
+                for line in obs_path.read_text(encoding='utf-8').split('\n'):
+                    line = line.strip()
+                    if line:
+                        _OBS_SEEN_CACHE[member_id].add(line)
+
+        # 提取当前 pane 中的所有有意义行
+        current_meaningful = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped and not _is_noise(stripped):
+                # 用行内容做 key（取前 200 字符去重）
+                key = stripped[:200]
+                if key not in _OBS_SEEN_CACHE[member_id]:
+                    _OBS_SEEN_CACHE[member_id].add(key)
+                    current_meaningful.append(stripped)
+
+        if current_meaningful:
+            obs_path = PROJECT_DIR / "bus" / member_id / "observations.txt"
+            timestamp = time.strftime('%H:%M:%S')
+            for line in current_meaningful:
+                entry = f'[{timestamp}] {line}\n'
+                with open(obs_path, 'a') as f:
+                    f.write(entry)
+
+            # 限制缓存大小
+            if len(_OBS_SEEN_CACHE[member_id]) > 1000:
+                _OBS_SEEN_CACHE[member_id] = set(sorted(_OBS_SEEN_CACHE[member_id])[-500:])
+
+            return content, True, current_meaningful
+
+        return content, False, []
     except Exception:
-        return prev_content.get(member_id, ''), False
+        return '', False, []
 
 
 def _build_observations_summary(member_id: str, max_lines: int = 15) -> str:
@@ -480,9 +527,13 @@ def _capture_member_status(session: str, member_id: str) -> str:
         return '(unknown)'
 
 
-def _build_wakeup_context(session: str, bus: FileMessageBus) -> str:
-    """构建唤醒消息：包含队员 findings + 调度器捕获的操作记录 + 实时状态。"""
-    parts = ["=== 系统通知 ===\n成员有新进展，请综合以下信息决策：\n"]
+def _build_wakeup_context(session: str, bus: FileMessageBus,
+                          stale_hint: str = "") -> str:
+    """构建唤醒消息：包含队员 findings + 实时状态 + 卡死警告。"""
+    parts = []
+    if stale_hint:
+        parts.append(stale_hint)
+    parts.append("=== 系统通知 ===\n成员有新进展，请综合以下信息决策：\n")
 
     for mid in ("member1", "member2", "member3"):
         finding = bus.get_finding(mid)
@@ -498,11 +549,20 @@ def _build_wakeup_context(session: str, bus: FileMessageBus) -> str:
         if status:
             parts.append(f"  {mid}: {status}")
 
+    # 操作记录（observations.txt 最近 10 行 — 筛选 noise 后的实时活动）
+    parts.append("\n【近期活动】")
     for mid in ("member1", "member2", "member3"):
-        obs = _build_observations_summary(mid)
-        if obs:
-            parts.append(f"\n【{mid} 操作记录】")
-            parts.append(obs)
+        obs_path = bus.bus_dir / mid / "observations.txt"
+        if obs_path.exists():
+            try:
+                obs_lines = obs_path.read_text(encoding="utf-8").strip().split("\n")
+                recent = [l for l in obs_lines if l.strip()][-10:]
+                if recent:
+                    parts.append(f"  {mid}:")
+                    for l in recent:
+                        parts.append(f"    {l.strip()}")
+            except Exception:
+                pass
 
     parts.append("\n---")
     parts.append("根据情况通过 advice_memberX.txt 进行针对性指挥。")
@@ -511,31 +571,59 @@ def _build_wakeup_context(session: str, bus: FileMessageBus) -> str:
 
 
 def _wake_agent(session: str, agent_id: str, message: str) -> None:
-    """向 agent 发送唤醒消息 + Enter 提交。先 Esc 清状态再 paste。"""
+    """向 agent 发送唤醒消息 + Enter 提交。先 Esc 清状态再 paste。
+
+    paste-buffer 被折叠时直接回车展开粘贴内容，确保消息完整发送。
+    """
     # 1. Esc 确保回到干净 prompt（打断思考 / 清 queued messages）
     subprocess.run(["tmux", "send-keys", "-t", f"{session}:{agent_id}", "Escape"],
                    capture_output=True, timeout=5)
-    time.sleep(0.4)
+    time.sleep(0.5)
 
-    # 2. Paste 消息
+    # 2. Try paste-buffer
     buf_name = f"swarm_{agent_id}"
     subprocess.run(["tmux", "set-buffer", "-b", buf_name, message],
                    capture_output=True, timeout=5)
     subprocess.run(["tmux", "paste-buffer", "-b", buf_name,
                     "-t", f"{session}:{agent_id}", "-d"],
                    capture_output=True, timeout=5)
-    time.sleep(0.5)
+    time.sleep(0.8)
 
-    # 3. 检查是否被 queue，需要 Up 提交
+    # 3. Check if paste was collapsed by Claude Code
     content = _capture_pane(session, agent_id)
-    if "queued messages" in content.lower():
-        subprocess.run(["tmux", "send-keys", "-t", f"{session}:{agent_id}", "Up"],
-                       capture_output=True, timeout=5)
-        time.sleep(0.3)
+    if "paste again to expand" in content.lower():
+        # Paste folded → just press Enter to expand + submit as one message
+        # This avoids _send_keys_typed splitting the message into separate inputs
+        pass
+    else:
+        # 4. 常规路径：检查是否被 queue，需要 Up 提交
+        if "queued messages" in content.lower():
+            subprocess.run(["tmux", "send-keys", "-t", f"{session}:{agent_id}", "Up"],
+                           capture_output=True, timeout=5)
+            time.sleep(0.3)
 
-    # 4. Enter 提交
+    # 5. Enter 提交（对于折叠的 paste，这会展开并提交；对于常规路径，提交已输入内容）
     subprocess.run(["tmux", "send-keys", "-t", f"{session}:{agent_id}", "Enter"],
                    capture_output=True, timeout=5)
+
+
+def _send_keys_typed(session: str, member_id: str, message: str) -> None:
+    """逐行用 send-keys 输入消息（paste-buffer 的回退方案）。
+
+    Claude Code 经常把 paste-buffer 折叠成 'paste again to expand'，
+    用 send-keys 模拟真实键盘输入虽然慢但 100% 可靠。
+
+    注意：过滤掉空行避免触发 API 400 "text content cannot be empty"。
+    """
+    lines = [l for l in message.split('\n') if l.strip()]
+    for i, line in enumerate(lines):
+        subprocess.run(
+            ["tmux", "send-keys", "-t", f"{session}:{member_id}", line],
+            capture_output=True, timeout=5)
+        if i < len(lines) - 1:
+            subprocess.run(
+                ["tmux", "send-keys", "-t", f"{session}:{member_id}", "Enter"],
+                capture_output=True, timeout=5)
 
 
 def _force_push_message(session: str, member_id: str, msg: str, buf_suffix: str = "fpush") -> None:
@@ -564,7 +652,13 @@ def _force_push_message(session: str, member_id: str, msg: str, buf_suffix: str 
     subprocess.run(["tmux", "paste-buffer", "-b", buf_name,
                     "-t", f"{session}:{member_id}", "-d"],
                    capture_output=True, timeout=5)
-    time.sleep(0.5)
+    time.sleep(0.8)
+
+    # Verify: paste-buffer often gets collapsed to "paste again to expand"
+    content = _capture_pane(session, member_id)
+    if "paste again to expand" in content.lower():
+        _send_keys_typed(session, member_id, msg)
+        time.sleep(0.5)
 
     # 检查是否被 queue，需要 Up 提交
     content = _capture_pane(session, member_id)
@@ -578,22 +672,54 @@ def _force_push_message(session: str, member_id: str, msg: str, buf_suffix: str 
 
 
 def _force_push_targeted_advice(session: str, member_id: str) -> None:
-    """强制打断某个成员：队长有针对性纠偏。"""
-    _force_push_message(session, member_id,
-        "=== ⚠ 紧急 ===\n"
-        f"队长有强制指示！请立即停止当前工作。\n"
-        f"读取 ./bus/leader/advice_{member_id}.txt 获取详细指令。",
-        buf_suffix="tadv")
+    """强制打断某个成员：队长有针对性纠偏。直接从文件中读取建议内容内联推送，
+    避免成员自己 Read 文件后 Write 副本到本地目录。"""
+    advice_path = Path(__file__).parent / "bus" / "leader" / f"advice_{member_id}.txt"
+    advice_content = ""
+    try:
+        if advice_path.exists():
+            lines = advice_path.read_text(encoding="utf-8").strip().split("\n")
+            advice_content = "\n".join(lines[:30])  # 最多30行
+    except Exception:
+        pass
+
+    if advice_content:
+        _force_push_message(session, member_id,
+            "=== ⚠ 紧急 ===\n"
+            f"队长强制指示（{member_id}）：\n\n"
+            f"{advice_content}",
+            buf_suffix="tadv")
+    else:
+        _force_push_message(session, member_id,
+            "=== ⚠ 紧急 ===\n"
+            f"队长有强制指示！请立即停止当前工作。\n"
+            f"读取 ./bus/leader/advice_{member_id}.txt 获取详细指令。",
+            buf_suffix="tadv")
 
 
 def _force_push_broadcast_advice(session: str) -> None:
-    """广播全局策略给所有成员：队长完成了战略部署。"""
+    """广播全局策略给所有成员：队长完成了战略部署。直接内联文件内容。"""
+    advice_path = Path(__file__).parent / "bus" / "leader" / "advice.txt"
+    advice_content = ""
+    try:
+        if advice_path.exists():
+            lines = advice_path.read_text(encoding="utf-8").strip().split("\n")
+            advice_content = "\n".join(lines[:30])
+    except Exception:
+        pass
+
     for mid in ("member1", "member2", "member3"):
-        _force_push_message(session, mid,
-            "=== 战略部署 ===\n"
-            "队长发布了全局策略！请立即停止当前工作。\n"
-            "读取 ./bus/leader/advice.txt 了解你的任务分配。",
-            buf_suffix="badv")
+        if advice_content:
+            _force_push_message(session, mid,
+                "=== 战略部署 ===\n"
+                f"队长发布了全局策略：\n\n{advice_content}",
+                buf_suffix="badv")
+        else:
+            _force_push_message(session, mid,
+                "=== 战略部署 ===\n"
+                "队长发布了全局策略！请立即停止当前工作。\n"
+                "读取 ./bus/leader/advice.txt 了解你的任务分配。",
+                buf_suffix="badv")
 
 
 # ── 启动增强：队长延迟 + 初始唤醒 ─────────────────
@@ -695,6 +821,100 @@ def _scan_panes_for_flag(session: str) -> tuple[str | None, str | None]:
 
 def _run_scheduler(config: dict, bus: FileMessageBus, session: str) -> None:
     """永久调度循环：监视文件 mtime 变化 → 唤醒对应 agent。不做判断，不做转述。"""
+    # ── ObservationBuffer：积累 observations → 适当时机推送给 leader ──
+    class ObservationBuffer:
+        """积累成员的 observations，在 leader 空闲时推送。
+
+        推送策略（避免频繁打断 leader）：
+        - 等待 advice.txt 写入后再开始推送，给 leader 完成战略部署的时间
+        - 最小间隔 90 秒，让 leader 有时间思考与写建议
+        - 积累 20 条或 6 轮再推送，减少琐碎干扰
+        - 内容去重：如果内容与上次推送基本相同，跳过
+        - 强制打断阈值提高到 40 条 / 15 轮（避免 leader 无限期忙导致丢消息）
+        """
+        _MIN_INTERVAL = 90.0       # 最短推送间隔（秒）
+        _FLUSH_MIN_ITEMS = 20       # buffer 满多少条就推送
+        _FLUSH_MIN_ROUNDS = 6       # 积累多少轮就推送
+        _FORCE_MAX_ITEMS = 40       # 堆积到上限强制打断 leader
+        _FORCE_MAX_ROUNDS = 15      # 积累上限轮次强制打断
+
+        def __init__(self):
+            self._buffer: dict[str, list[tuple[str, str]]] = {}
+            self._rounds = 0
+            self._last_flush = 0.0
+            self._last_body_hash = ''  # 上次推送内容的 hash，用于去重
+            self._advice_seen = False  # advice.txt 是否已被调度器检测到
+
+        def add(self, member_id: str, lines: list[str]) -> None:
+            ts = time.strftime('%H:%M:%S')
+            if member_id not in self._buffer:
+                self._buffer[member_id] = []
+            for line in lines:
+                self._buffer[member_id].append((ts, line.strip()[:120]))
+
+        @property
+        def _total(self) -> int:
+            return sum(len(v) for v in self._buffer.values())
+
+        def _body(self) -> str:
+            """生成不变更内部状态的 body，用于去重比较。"""
+            lines_out = []
+            for mid in ("member1", "member2", "member3"):
+                entries = self._buffer.get(mid, [])
+                if entries:
+                    lines_out.append(f"[{mid}]: {len(entries)}条")
+                    for ts, line in entries[-5:]:
+                        lines_out.append(f"  [{ts}] {line[:120]}")
+            return '\n'.join(lines_out)
+
+        def decide(self, now_mono: float, leader_idle: bool) -> str | None:
+            """决策是否推送。返回消息字符串(需推送)或 None(继续积累)。"""
+            if self._total == 0:
+                self._rounds = 0
+                return None
+
+            elapsed = now_mono - self._last_flush
+
+            # 强制打断：堆积过多（不受内容去重影响）
+            if self._total >= self._FORCE_MAX_ITEMS or self._rounds >= self._FORCE_MAX_ROUNDS:
+                return self._build(now_mono)
+
+            # Leader 忙 → 只积累，不推送
+            if not leader_idle:
+                self._rounds += 1
+                return None
+
+            # 还没到最小间隔
+            if elapsed < self._MIN_INTERVAL:
+                self._rounds += 1
+                return None
+
+            # 内容去重：如果 body 跟上一次推的一模一样，跳过
+            current_body = self._body()
+            if current_body == self._last_body_hash:
+                self._rounds += 1
+                return None
+
+            self._rounds += 1
+            if self._total >= self._FLUSH_MIN_ITEMS or self._rounds >= self._FLUSH_MIN_ROUNDS:
+                return self._build(now_mono)
+
+            return None
+
+        def _build(self, now_mono: float) -> str:
+            parts = [f"【观测积累 — 共 {self._total} 条新活动】"]
+            for mid in ("member1", "member2", "member3"):
+                entries = self._buffer.get(mid, [])
+                if entries:
+                    parts.append(f"  [{mid}]:")
+                    for ts, line in entries[-5:]:
+                        parts.append(f"    [{ts}] {line[:120]}")
+                    self._buffer[mid] = []
+            self._last_flush = now_mono
+            self._rounds = 0
+            self._last_body_hash = ''
+            return "\n".join(parts)
+
     log("调度器启动 — 文件监视模式")
 
     # 跟踪 mtime
@@ -702,14 +922,18 @@ def _run_scheduler(config: dict, bus: FileMessageBus, session: str) -> None:
     _advice_txt_mtime: float = 0.0
     _advice_mtimes: dict[str, float] = {}
     _pending_leader_notify = False
-    _prev_pane_contents: dict[str, str] = {}
     _last_heartbeat_ts = 0.0
-    _HEARTBEAT_INTERVAL = 120.0  # 每 120s 推送状态心跳给队长
+    _HEARTBEAT_INTERVAL = 180.0  # 每 180s 向队长同步队员状态
+    _STALE_THRESHOLD = 300.0    # 成员 findings 超过 5 分钟无变化视为卡死
     _last_leader_wake = 0.0
     _last_member_wake: dict[str, float] = {}
+    _findings_hashes: dict[str, str] = {}  # content hash for stale detection
+    _last_stale_warn: dict[str, float] = {}  # last time we warned about each member being stale
     # API 错误自动恢复跟踪
     _agent_error_counts: dict[str, int] = {}
     _last_agent_recovery: dict[str, float] = {}
+    # ObservationBuffer：积累 observations → 适当时机推送 leader
+    _obs_buffer = ObservationBuffer()
     startup_time = time.monotonic()
 
     # 初始化：记录当前 mtime（避免启动时误触发）
@@ -719,6 +943,11 @@ def _run_scheduler(config: dict, bus: FileMessageBus, session: str) -> None:
     for mid in ("member1", "member2", "member3"):
         fp = bus.bus_dir / mid / "findings.txt"
         _findings_mtimes[mid] = fp.stat().st_mtime if fp.exists() else 0
+        try:
+            _findings_hashes[mid] = fp.read_text(encoding='utf-8') if fp.exists() else ''
+        except Exception:
+            _findings_hashes[mid] = ''
+        _last_stale_warn[mid] = time.monotonic()
         ap = bus.bus_dir / "leader" / f"advice_{mid}.txt"
         _advice_mtimes[mid] = ap.stat().st_mtime if ap.exists() else 0
         _agent_error_counts[mid] = 0
@@ -776,6 +1005,12 @@ def _run_scheduler(config: dict, bus: FileMessageBus, session: str) -> None:
                 if cur != prev:
                     _findings_mtimes[mid] = cur
                     _pending_leader_notify = True
+                    # 更新 content hash 用于卡死检测
+                    try:
+                        _findings_hashes[mid] = fp.read_text(encoding='utf-8')
+                    except Exception:
+                        _findings_hashes[mid] = ''
+                    _last_stale_warn[mid] = now_mono
 
             if _pending_leader_notify:
                 if now_mono - _last_leader_wake >= _MIN_WAKEUP_INTERVAL:
@@ -806,20 +1041,28 @@ def _run_scheduler(config: dict, bus: FileMessageBus, session: str) -> None:
                         _last_member_wake[mid] = now_mono
                         log(f"强制打断 {mid}（新建议）")
 
-            # ── 被动捕获操作记录 ──
-            has_new_obs = False
+            # ── 捕获操作记录 → 持久化 + 喂入 ObservationBuffer ──
             for mid in ("member1", "member2", "member3"):
-                new_content, meaningful = _capture_observations(session, mid, _prev_pane_contents)
-                _prev_pane_contents[mid] = new_content
-                if meaningful:
-                    has_new_obs = True
+                _, _, new_lines = _capture_observations(session, mid)
+                if new_lines:
+                    _obs_buffer.add(mid, new_lines)
 
-            if has_new_obs and not _pending_leader_notify:
-                if now_mono - _last_leader_wake >= _MIN_WAKEUP_INTERVAL:
-                    _pending_leader_notify = True
-                    log("捕获操作记录，待通知队长")
+            # ── ObservationBuffer 决策：是否推送积累的观测给 leader ──
+            leader_idle = _is_agent_idle(session, "leader")
+            obs_msg = _obs_buffer.decide(now_mono, leader_idle)
+            if obs_msg:
+                if leader_idle:
+                    _wake_agent(session, "leader",
+                        _build_wakeup_context(session, bus) + "\n\n" + obs_msg)
+                    _last_leader_wake = now_mono
+                    log("观测积累推送 leader")
+                else:
+                    # 强制打断（堆积过多）
+                    _wake_agent(session, "leader", obs_msg)
+                    _last_leader_wake = now_mono
+                    log("观测积累强制打断 leader")
 
-            # ── 状态心跳：长思考无产出时仍通知队长 ──
+            # ── 状态心跳：定时向队长同步队员动向 ──
             if (now_mono - _last_heartbeat_ts >= _HEARTBEAT_INTERVAL
                     and now_mono - _last_leader_wake >= _MIN_WAKEUP_INTERVAL):
                 _last_heartbeat_ts = now_mono
@@ -828,6 +1071,32 @@ def _run_scheduler(config: dict, bus: FileMessageBus, session: str) -> None:
                         _build_wakeup_context(session, bus))
                     _last_leader_wake = now_mono
                     log("状态心跳唤醒 leader")
+
+            # ── 卡死检测：成员 findings 长时间未变化 → 预警 leader ──
+            stale_alert = []
+            for mid in ("member1", "member2", "member3"):
+                last_change = _last_stale_warn.get(mid, startup_time)
+                if now_mono - last_change >= _STALE_THRESHOLD:
+                    fp = bus.bus_dir / mid / "findings.txt"
+                    try:
+                        cur_hash = fp.read_text(encoding='utf-8')
+                        prev_hash = _findings_hashes.get(mid, '')
+                        if cur_hash == prev_hash and cur_hash.strip():
+                            stale_alert.append(mid)
+                    except Exception:
+                        pass
+
+            if stale_alert and now_mono - _last_leader_wake >= _MIN_WAKEUP_INTERVAL:
+                if _is_agent_idle(session, "leader"):
+                    _wake_agent(session, "leader",
+                        _build_wakeup_context(session, bus,
+                            stale_hint="⚠️ 卡死预警：以下成员长时间无进展：" +
+                            ", ".join(stale_alert)))
+                    _last_leader_wake = now_mono
+                    # Reset stale timers so we don't spam
+                    for mid in stale_alert:
+                        _last_stale_warn[mid] = now_mono
+                    log(f"卡死预警唤醒 leader（{' '.join(stale_alert)}）")
 
             # ── Agent 健康检测：API 错误自动恢复 ──
             for agent_id in ("leader", "member1", "member2", "member3"):
