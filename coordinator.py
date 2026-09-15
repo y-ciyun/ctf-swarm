@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 
 import yaml
@@ -186,7 +187,7 @@ def _start_one_agent(session: str, agent_id: str, agent_type: str,
 
     # Start claude
     claude_path = "/home/yy/.nvm/versions/node/v24.15.0/bin/claude"
-    startup = f"cd {PROJECT_DIR} && {env_exports} && export PATH=/home/yy/.nvm/versions/node/v24.15.0/bin:$PATH && {claude_path} --bare --permission-mode bypassPermissions"
+    startup = f"cd {PROJECT_DIR} && {env_exports} && export PATH=/home/yy/.nvm/versions/node/v24.15.0/bin:$PATH && {claude_path} --bare --dangerously-skip-permissions"
     subprocess.run(["tmux", "send-keys", "-t", f"{session}:{window_name}",
                     startup, "Enter"], capture_output=True, timeout=10)
 
@@ -390,12 +391,15 @@ def _has_api_error(content: str) -> bool:
 
 def _recover_agent(session: str, agent_id: str) -> None:
     """Recover an agent from API error by sending Enter to retry."""
-    subprocess.run(["tmux", "send-keys", "-t", f"{session}:{agent_id}", "Escape"],
-                   capture_output=True, timeout=5)
-    time.sleep(0.3)
-    subprocess.run(["tmux", "send-keys", "-t", f"{session}:{agent_id}", "Enter"],
-                   capture_output=True, timeout=5)
-    log(f"🔄 自动恢复 {agent_id}（API 错误后重试）")
+    try:
+        subprocess.run(["tmux", "send-keys", "-t", f"{session}:{agent_id}", "Escape"],
+                       capture_output=True, timeout=5)
+        time.sleep(0.3)
+        subprocess.run(["tmux", "send-keys", "-t", f"{session}:{agent_id}", "Enter"],
+                       capture_output=True, timeout=5)
+        log(f"🔄 自动恢复 {agent_id}（API 错误后重试）")
+    except Exception:
+        log(f"WARNING: 恢复 {agent_id} 失败（tmux 操作异常）")
 
 
 # ── 被动捕获：观察 agent 操作 ──────────────────────
@@ -572,43 +576,40 @@ def _wake_agent(session: str, agent_id: str, message: str) -> None:
 
     paste-buffer 被折叠时直接回车展开粘贴内容，确保消息完整发送。
     """
-    # 0. 存活检测：如果 claude 已退出，跳过发送
-    content = _capture_pane(session, agent_id)
-    if '└─$' in content or 'bash' in content or 'zsh' in content:
-        if '❯' not in content:
-            log(f"WARNING: {agent_id} 已退出到 shell，跳过唤醒")
-            return
+    try:
+        # 0. 存活检测：如果 claude 已退出，跳过发送
+        content = _capture_pane(session, agent_id)
+        if '└─$' in content or 'bash' in content or 'zsh' in content:
+            if '❯' not in content:
+                log(f"WARNING: {agent_id} 已退出到 shell，跳过唤醒")
+                return
 
-    # 1. Esc 确保回到干净 prompt（打断思考 / 清 queued messages）
-    subprocess.run(["tmux", "send-keys", "-t", f"{session}:{agent_id}", "Escape"],
-                   capture_output=True, timeout=5)
-    time.sleep(0.5)
+        # 1. Esc 确保回到干净 prompt（打断思考 / 清 queued messages）
+        subprocess.run(["tmux", "send-keys", "-t", f"{session}:{agent_id}", "Escape"],
+                       capture_output=True, timeout=5)
+        time.sleep(0.5)
 
-    # 2. Try paste-buffer
-    buf_name = f"swarm_{agent_id}"
-    subprocess.run(["tmux", "set-buffer", "-b", buf_name, message],
-                   capture_output=True, timeout=5)
-    subprocess.run(["tmux", "paste-buffer", "-b", buf_name,
-                    "-t", f"{session}:{agent_id}", "-d"],
-                   capture_output=True, timeout=5)
-    time.sleep(0.8)
+        # 2. Try paste-buffer
+        buf_name = f"swarm_{agent_id}"
+        subprocess.run(["tmux", "set-buffer", "-b", buf_name, message],
+                       capture_output=True, timeout=5)
+        subprocess.run(["tmux", "paste-buffer", "-b", buf_name,
+                        "-t", f"{session}:{agent_id}", "-d"],
+                       capture_output=True, timeout=5)
+        time.sleep(0.8)
 
-    # 3. Check if paste was collapsed by Claude Code
-    content = _capture_pane(session, agent_id)
-    if "paste again to expand" in content.lower():
-        # Paste folded → just press Enter to expand + submit as one message
-        # This avoids _send_keys_typed splitting the message into separate inputs
-        pass
-    else:
-        # 4. 常规路径：检查是否被 queue，需要 Up 提交
+        # 3. Check if message was queued (needs Up to bring to input area)
+        content = _capture_pane(session, agent_id)
         if "queued messages" in content.lower():
             subprocess.run(["tmux", "send-keys", "-t", f"{session}:{agent_id}", "Up"],
                            capture_output=True, timeout=5)
             time.sleep(0.3)
 
-    # 5. Enter 提交（对于折叠的 paste，这会展开并提交；对于常规路径，提交已输入内容）
-    subprocess.run(["tmux", "send-keys", "-t", f"{session}:{agent_id}", "Enter"],
-                   capture_output=True, timeout=5)
+        # 4. Enter submits; if paste was folded, this expands + submits in one press
+        subprocess.run(["tmux", "send-keys", "-t", f"{session}:{agent_id}", "Enter"],
+                       capture_output=True, timeout=5)
+    except Exception:
+        log(f"WARNING: 唤醒 {agent_id} 失败（tmux 操作异常）")
 
 
 def _send_keys_typed(session: str, member_id: str, message: str) -> None:
@@ -639,40 +640,43 @@ def _force_push_message(session: str, member_id: str, msg: str, buf_suffix: str 
     - Interrupted → 直接输入（无需 Esc）
     - 空闲 → 直接输入
     """
-    content = _capture_pane(session, member_id)
-    needs_interrupt = (
-        not _is_agent_idle(session, member_id)
-        and "what should claude do instead" not in content.lower()
-    )
+    try:
+        content = _capture_pane(session, member_id)
+        needs_interrupt = (
+            not _is_agent_idle(session, member_id)
+            and "what should claude do instead" not in content.lower()
+        )
 
-    if needs_interrupt:
-        subprocess.run(["tmux", "send-keys", "-t", f"{session}:{member_id}", "Escape"],
+        if needs_interrupt:
+            subprocess.run(["tmux", "send-keys", "-t", f"{session}:{member_id}", "Escape"],
+                           capture_output=True, timeout=5)
+            time.sleep(0.4)
+
+        buf_name = f"{buf_suffix}_{member_id}"
+        subprocess.run(["tmux", "set-buffer", "-b", buf_name, msg],
                        capture_output=True, timeout=5)
-        time.sleep(0.4)
-
-    buf_name = f"{buf_suffix}_{member_id}"
-    subprocess.run(["tmux", "set-buffer", "-b", buf_name, msg],
-                   capture_output=True, timeout=5)
-    subprocess.run(["tmux", "paste-buffer", "-b", buf_name,
-                    "-t", f"{session}:{member_id}", "-d"],
-                   capture_output=True, timeout=5)
-    time.sleep(0.8)
-
-    # Verify: paste-buffer often gets collapsed to "paste again to expand"
-    content = _capture_pane(session, member_id)
-    if "paste again to expand" in content.lower():
-        # 直接回车展开粘贴内容，避免拆散消息
-        time.sleep(0.3)
-
-    # 检查是否被 queue，需要 Up 提交
-    content = _capture_pane(session, member_id)
-    if "queued messages" in content.lower():
-        subprocess.run(["tmux", "send-keys", "-t", f"{session}:{member_id}", "Up"],
+        subprocess.run(["tmux", "paste-buffer", "-b", buf_name,
+                        "-t", f"{session}:{member_id}", "-d"],
                        capture_output=True, timeout=5)
-        time.sleep(0.3)
+        time.sleep(0.8)
 
-    subprocess.run(["tmux", "send-keys", "-t", f"{session}:{member_id}", "Enter"],
-                   capture_output=True, timeout=5)
+        # Verify: paste-buffer often gets collapsed to "paste again to expand"
+        content = _capture_pane(session, member_id)
+        if "paste again to expand" in content.lower():
+            # 直接回车展开粘贴内容，避免拆散消息
+            time.sleep(0.3)
+
+        # 检查是否被 queue，需要 Up 提交
+        content = _capture_pane(session, member_id)
+        if "queued messages" in content.lower():
+            subprocess.run(["tmux", "send-keys", "-t", f"{session}:{member_id}", "Up"],
+                           capture_output=True, timeout=5)
+            time.sleep(0.3)
+
+        subprocess.run(["tmux", "send-keys", "-t", f"{session}:{member_id}", "Enter"],
+                       capture_output=True, timeout=5)
+    except Exception:
+        log(f"WARNING: 强制推送消息给 {member_id} 失败（tmux 操作异常）")
 
 
 def _force_push_targeted_advice(session: str, member_id: str) -> None:
@@ -927,8 +931,7 @@ def _run_scheduler(config: dict, bus: FileMessageBus, session: str) -> None:
 
             self._rounds += 1
             if (self._total >= self._FLUSH_MIN_ITEMS
-                    or self._rounds >= self._FLUSH_MIN_ROUNDS
-                    or self._findings_changed):
+                    or self._rounds >= self._FLUSH_MIN_ROUNDS):
                 return self._build(now_mono)
 
             return None
@@ -1103,6 +1106,7 @@ def _run_scheduler(config: dict, bus: FileMessageBus, session: str) -> None:
                     _wake_agent(session, "leader", obs_msg)
                     _last_leader_wake = now_mono
                     log("观测积累强制打断 leader")
+                _last_heartbeat_ts = now_mono  # buffer 刚推过，重置心跳计时器避免冗余唤醒
 
             # ── 状态心跳：定时向队长同步队员动向 ──
             if (now_mono - _last_heartbeat_ts >= _HEARTBEAT_INTERVAL
@@ -1163,6 +1167,9 @@ def _run_scheduler(config: dict, bus: FileMessageBus, session: str) -> None:
 
     except KeyboardInterrupt:
         log("调度器停止")
+    except Exception as e:
+        log(f"调度器异常崩溃: {e}")
+        traceback.print_exc()
 
 
 def print_manual_instructions(config: dict, prompt_info: list) -> None:
