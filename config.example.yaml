@@ -1,0 +1,33 @@
+# CTF Swarm 配置示例
+#
+# 使用方法：
+#   1. 复制本文件为 config.yaml
+#        cp config.example.yaml config.yaml
+#   2. 把 YOUR_API_KEY_HERE 替换为你的真实 API 密钥
+#   3. config.yaml 已被 .gitignore 排除，不会进入版本库
+#
+# 每个 Agent 可独立配置不同的 LLM 后端（云端 API 或本地模型均可）。
+
+bus_dir: "bus"
+
+members:
+  - id: member1
+    base_url: "https://api.deepseek.com/anthropic"
+    api_key: "YOUR_API_KEY_HERE"
+    model: "deepseek-chat"
+
+  - id: member2
+    base_url: "https://api.deepseek.com/anthropic"
+    api_key: "YOUR_API_KEY_HERE"
+    model: "deepseek-chat"
+
+  - id: member3
+    base_url: "https://api.deepseek.com/anthropic"
+    api_key: "YOUR_API_KEY_HERE"
+    model: "deepseek-chat"
+
+leader:
+  id: leader
+  base_url: "https://api.deepseek.com/anthropic"
+  api_key: "YOUR_API_KEY_HERE"
+  model: "deepseek-chat"
