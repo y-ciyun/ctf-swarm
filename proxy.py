@@ -7,6 +7,7 @@ Anthropic Messages API 格式转为 OpenAI Chat Completions 格式，
 """
 
 import json
+import os
 import time
 import uuid
 
@@ -14,8 +15,10 @@ import requests
 from flask import Flask, jsonify, request
 
 # ── 配置 ──────────────────────────────────────────────
-APIPOD_API_KEY = "***REMOVED-API-KEY***"
-APIPOD_BASE_URL = "https://api.apipod.ai/v1"
+# 密钥通过环境变量提供，切勿硬编码提交：
+#   export APIPOD_API_KEY="your-key-here"
+APIPOD_API_KEY = os.environ.get("APIPOD_API_KEY", "")
+APIPOD_BASE_URL = os.environ.get("APIPOD_BASE_URL", "https://api.apipod.ai/v1")
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 3001
 
